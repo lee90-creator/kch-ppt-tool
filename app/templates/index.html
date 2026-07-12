@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero card">
+  <div>
+    <p class="eyebrow">표준 생성 폼</p>
+    <h1>자료를 업로드하고 회사 보고용 PPT를 생성합니다</h1>
+    <p class="hero__copy">여러 문서와 이미지를 한 번에 올린 뒤, 설치된 CLI 중 하나를 선택해 작업을 시작하세요.</p>
+  </div>
+  <a class="button button--ghost" href="{{ url_for('page_guide') }}">CLI 설치 안내 보기</a>
+</section>
+
+<section id="retry-banner" class="banner banner--info" hidden>
+  이전 작업의 입력값을 불러왔습니다. 보안상 파일은 자동 복원되지 않으므로 다시 선택해 주세요.
+</section>
+
+<section id="no-cli-banner" class="banner banner--warning" hidden>
+  사용 가능한 CLI가 없습니다. <a href="{{ url_for('page_guide') }}">설치·로그인 안내</a>를 확인한 뒤 서버를 새로고침하세요.
+</section>
+
+<form id="job-form" class="card form" method="post" enctype="multipart/form-data" novalidate>
+  <fieldset id="job-fieldset" data-notice-gated disabled>
+    <div class="form-grid">
+      <label class="field field--full">
+        <span class="field__label">입력 파일</span>
+        <input id="files" name="files" type="file" accept="{{ allowed_accept }}" multiple required>
+        <span class="field__help">허용 확장자: {{ allowed_extensions }} · 파일당 {{ per_file_limit_mb }}MB 이하 · 전체 {{ total_upload_limit_gb }}GB 이하</span>
+      </label>
+
+      <label class="field field--full">
+        <span class="field__label">요청사항</span>
+        <textarea id="request_text" name="request_text" rows="6" placeholder="예: 핵심 결론을 먼저 제시하고, 경영진 의사결정용 8~10장 보고서로 구성해 주세요."></textarea>
+      </label>
+
+      <div class="field field--full">
+        <div class="field__header">
+          <span class="field__label">CLI 선택</span>
+          <span class="field__help">/api/meta에서 감지된 CLI 중 사용 가능 항목만 선택할 수 있습니다.</span>
+        </div>
+        <div id="cli-options" class="choice-list" aria-live="polite">
+          <p class="muted">CLI 상태를 불러오는 중입니다.</p>
+        </div>
+      </div>
+
+      <label class="field">
+        <span class="field__label">페이지 수</span>
+        <input id="page_range" name="page_range" type="text" value="8~10" inputmode="text" placeholder="8~10">
+      </label>
+
+      <label class="field">
+        <span class="field__label">청중/용도</span>
+        <select id="audience" name="audience">
+          <option value="경영진 보고" selected>경영진 보고</option>
+          <option value="팀 공유">팀 공유</option>
+          <option value="고객 제안">고객 제안</option>
+          <option value="교육 자료">교육 자료</option>
+        </select>
+      </label>
+
+      <div class="field field--full">
+        <span class="field__label">이미지 소스</span>
+        <div class="segmented" role="radiogroup" aria-label="이미지 소스">
+          <label><input type="radio" name="image_source" value="none" checked> 사용 안 함</label>
+          <label><input type="radio" name="image_source" value="ai"> AI 생성</label>
+          <label><input type="radio" name="image_source" value="web"> 웹 검색</label>
+        </div>
+      </div>
+
+      <label class="switch field--full">
+        <input id="company_style" name="company_style" type="checkbox" checked>
+        <span class="switch__control" aria-hidden="true"></span>
+        <span>
+          <strong>회사 스타일 적용</strong>
+          <small>기본 ON · 추출된 보고서 스타일 규칙을 프롬프트에 반영합니다.</small>
+        </span>
+      </label>
+    </div>
+  </fieldset>
+
+  <div class="form__actions">
+    <button id="submit-job" class="button button--primary" type="submit" disabled>작업 생성</button>
+    <p id="form-message" class="form-message" role="status" aria-live="polite"></p>
+  </div>
+</form>
+{% endblock %}

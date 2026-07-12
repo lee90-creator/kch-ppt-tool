@@ -1,0 +1,20 @@
+<div id="notice-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="notice-title" hidden>
+  <div class="modal__backdrop"></div>
+  <section class="modal__panel" aria-describedby="notice-desc" tabindex="-1">
+    <p class="eyebrow">최초 실행 보안 고지</p>
+    <h2 id="notice-title">자동승인 실행에 대한 동의가 필요합니다</h2>
+    <p id="notice-desc">
+      본 도구는 사용자가 선택한 CLI를 자동승인 모드로 실행하며, 업로드 자료는 작업별 격리 폴더에서 처리합니다.
+      외부 CLI 실행 특성을 이해하고 동의한 경우에만 작업을 생성할 수 있습니다.
+    </p>
+    <ul class="notice-list">
+      <li>선택한 CLI가 생성 과정을 자동으로 수행합니다.</li>
+      <li>작업 산출물과 로그는 로컬 작업 폴더에 저장됩니다.</li>
+      <li>동의 전에는 생성 폼 제출이 비활성화됩니다.</li>
+    </ul>
+    <div class="modal__actions">
+      <button id="notice-accept" class="button button--primary" type="button">동의하고 시작</button>
+    </div>
+    <p id="notice-error" class="form-message form-message--error" hidden></p>
+  </section>
+</div>

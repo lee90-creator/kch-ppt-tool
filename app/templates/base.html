@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} · PPT 웹도구</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-page="{{ page|default('') }}"{% if job_id is defined %} data-job-id="{{ job_id }}"{% endif %}>
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="{{ url_for('page_index') }}" aria-label="PPT 웹도구 홈">
+        <span class="brand__mark">P</span>
+        <span>
+          <strong>PPT 웹도구</strong>
+          <small>자료 기반 발표자료 생성</small>
+        </span>
+      </a>
+      <nav class="nav" aria-label="주요 메뉴">
+        <a class="nav__link{% if page == 'index' %} is-active{% endif %}" href="{{ url_for('page_index') }}">생성</a>
+        <a class="nav__link{% if page == 'history' %} is-active{% endif %}" href="{{ url_for('page_history') }}">이력</a>
+        <a class="nav__link{% if page == 'settings' %} is-active{% endif %}" href="{{ url_for('page_settings') }}">설정</a>
+        <a class="nav__link{% if page == 'guide' %} is-active{% endif %}" href="{{ url_for('page_guide') }}">가이드</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  {% include "notice.html" %}
+
+  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

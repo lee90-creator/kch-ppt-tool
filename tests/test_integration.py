@@ -1,0 +1,751 @@
+from __future__ import annotations
+
+import base64
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+from pathlib import Path
+from typing import Any, Callable
+
+from app import server as server_module
+from app.images.intake import intake_images
+from app.job_runner import BusyError, DEFAULT_TIMEOUT_SECONDS, JobRunner
+from app.job_store import JobStore
+from app.results import collect_result_files
+from app.paths import resolve_ppt_master_root
+from app.preprocess import preprocess_job
+from app.stage_contract import (
+    Stage,
+    ValidationResult,
+    make_outputs_exist_validator,
+    make_pptx_valid_validator,
+    make_raw_absent_validator,
+)
+from app.storage import Settings
+
+
+TERMINAL_STATUSES = {"done", "failed", "cancelled"}
+EXPECTED_PPTX = ["projects/*/exports/*.pptx"]
+FAKE_CLI = Path(__file__).with_name("fake_cli.py").resolve()
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
+
+class FakeServerAdapter:
+    name = "fake"
+
+    def build_stages(self, job_ctx: dict[str, Any], _prompt: str) -> list[Stage]:
+        expected_outputs = list(EXPECTED_PPTX)
+        return [
+            Stage(
+                id="fake_agent_oneshot",
+                kind="agent",
+                owner="agent",
+                command=[sys.executable, str(FAKE_CLI), "success"],
+                cwd=job_ctx["project_dir"],
+                env={},
+                expected_outputs=expected_outputs,
+                validators=[
+                    make_outputs_exist_validator(expected_outputs),
+                    make_pptx_valid_validator(EXPECTED_PPTX[0]),
+                    make_raw_absent_validator(),
+                ],
+                timeout_seconds=30,
+            )
+        ]
+
+
+class ImageEnvServerAdapter(server_module.CliAdapter):
+    name = "fake"
+    EXPECTED_OUTPUTS = EXPECTED_PPTX
+    PPTX_OUTPUT_GLOB = EXPECTED_PPTX[0]
+    TIMEOUT_SECONDS = 30
+    captured_envs: list[dict[str, str]] = []
+
+    def _build_command(self, _prompt: str, _job_ctx: dict[str, Any] | None = None) -> list[str]:
+        return [sys.executable, str(FAKE_CLI), "success"]
+
+    def build_stages(self, job_ctx: dict[str, Any], prompt: str) -> list[Stage]:
+        stages = super().build_stages(job_ctx, prompt)
+        self.captured_envs.append(dict(stages[0].env))
+        return stages
+
+def _ok_manifest(workspace: str | Path) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "job_id": Path(workspace).name,
+        "uploads": [],
+        "preprocess": {"status": "ok", "detail": "test preprocess ok"},
+    }
+
+
+class IntegrationTest(unittest.TestCase):
+    def _runner(self, root: Path) -> JobRunner:
+        return JobRunner(root / "workspace", root / "data")
+
+    def _project_dir(self, runner: JobRunner, job_id: str) -> Path:
+        return runner.workspace_root / job_id / "project"
+
+    def _fake_stage(
+        self,
+        runner: JobRunner,
+        job_id: str,
+        mode: str,
+        *,
+        validators: list[Callable[[dict[str, Any]], ValidationResult]] | None = None,
+        timeout_seconds: int = 30,
+    ) -> Stage:
+        return Stage(
+            id=f"fake_{mode}",
+            kind="export",
+            owner="script",
+            command=[sys.executable, str(FAKE_CLI), mode],
+            cwd=str(self._project_dir(runner, job_id)),
+            env={},
+            expected_outputs=list(EXPECTED_PPTX),
+            validators=list(validators or []),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _wait_for(
+        self,
+        runner: JobRunner,
+        job_id: str,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        timeout_seconds: float = 15.0,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        last_status = runner.get_status(job_id)
+        while time.monotonic() < deadline:
+            last_status = runner.get_status(job_id)
+            if predicate(last_status):
+                return last_status
+            time.sleep(0.1)
+        self.fail(f"timed out waiting for {job_id}; last status={last_status}")
+
+    def _wait_terminal(self, runner: JobRunner, job_id: str, *, timeout_seconds: float = 15.0) -> dict[str, Any]:
+        return self._wait_for(
+            runner,
+            job_id,
+            lambda status: status.get("status") in TERMINAL_STATUSES,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _join_job_thread(self, runner: JobRunner, job_id: str, *, timeout_seconds: float = 5.0) -> None:
+        job = runner._jobs.get(job_id)  # Integration coverage for background cleanup.
+        thread = getattr(job, "thread", None)
+        if thread is None:
+            return
+        thread.join(timeout_seconds)
+        self.assertFalse(thread.is_alive(), f"job thread did not stop for {job_id}")
+
+    def _pid_is_running(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _post_fake_job(self, client: Any, *, filename: str = "pixel.png") -> Any:
+        return client.post(
+            "/api/jobs",
+            data={
+                "request_text": "make a deck",
+                "image_source": "none",
+                "cli": "fake",
+                "files": (io.BytesIO(PNG_1X1), filename),
+            },
+            content_type="multipart/form-data",
+        )
+
+    def test_job_success_generates_results_and_validators_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = self._runner(root)
+            job_id = "success-job"
+            validators = [
+                make_outputs_exist_validator(EXPECTED_PPTX),
+                make_pptx_valid_validator(EXPECTED_PPTX[0]),
+            ]
+            stage = self._fake_stage(runner, job_id, "success", validators=validators)
+
+            runner.submit([stage], job_id=job_id)
+            self._wait_terminal(runner, job_id)
+            self._join_job_thread(runner, job_id)
+            final = runner.get_status(job_id)
+
+            self.assertEqual(final["status"], "done")
+            result_files = final.get("result_files")
+            self.assertIsInstance(result_files, list)
+            self.assertTrue(result_files)
+            workspace = runner.workspace_root / job_id
+            for result_file in result_files:
+                self.assertTrue((workspace / str(result_file)).is_file(), result_file)
+
+            ctx = {"cwd": str(self._project_dir(runner, job_id)), "project_dir": str(self._project_dir(runner, job_id))}
+            for validator in validators:
+                result = validator(ctx)
+                self.assertTrue(result.ok, result.reason)
+
+    def test_job_failure_records_exit_code_and_keeps_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = self._runner(root)
+            job_id = "fail-job"
+            stage = self._fake_stage(runner, job_id, "fail")
+
+            runner.submit([stage], job_id=job_id)
+            self._wait_terminal(runner, job_id)
+            self._join_job_thread(runner, job_id)
+            final = runner.get_status(job_id)
+
+            self.assertEqual(final["status"], "failed")
+            self.assertIn("exit_code=3", str(final.get("reason")))
+            log_path = Path(str(final["log_path"]))
+            self.assertTrue(log_path.is_file())
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("PROCESS_EXIT", log_text)
+            self.assertIn("exit_code", log_text)
+
+    def test_cancel_hang_job_preserves_workspace_and_stops_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = self._runner(root)
+            job_id = "cancel-job"
+            stage = self._fake_stage(runner, job_id, "hang", timeout_seconds=60)
+
+            runner.submit([stage], job_id=job_id)
+            running = self._wait_for(
+                runner,
+                job_id,
+                lambda status: any(event.get("event") == "PROCESS_START" for event in status.get("events", [])),
+                timeout_seconds=10,
+            )
+            pids = [event["pid"] for event in running["events"] if event.get("event") == "PROCESS_START"]
+            self.assertTrue(pids)
+
+            cancelled = runner.cancel(job_id)
+            self.assertEqual(cancelled["status"], "cancelled")
+            self._wait_terminal(runner, job_id)
+            self._join_job_thread(runner, job_id)
+            final = runner.get_status(job_id)
+
+            self.assertEqual(final["status"], "cancelled")
+            self.assertTrue(Path(str(final["workspace"])).is_dir())
+            events = final.get("events", [])
+            self.assertTrue(any(event.get("event") == "TERMINATE" for event in events))
+            self.assertTrue(any(event.get("event") == "PROCESS_EXIT" for event in events))
+            for pid in pids:
+                self.assertFalse(self._pid_is_running(int(pid)), f"process still exists: {pid}")
+
+    def test_hang_job_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = self._runner(root)
+            job_id = "timeout-job"
+            stage = self._fake_stage(runner, job_id, "hang", timeout_seconds=5)
+
+            runner.submit([stage], job_id=job_id)
+            self._wait_terminal(runner, job_id, timeout_seconds=15)
+            self._join_job_thread(runner, job_id)
+            final = runner.get_status(job_id)
+
+            self.assertEqual(final["status"], "failed")
+            self.assertIn("제한 시간", str(final.get("reason")))
+            self.assertIn("5", str(final.get("reason")))
+            self.assertTrue(any(event.get("event") == "TIMEOUT" for event in final.get("events", [])))
+
+    def test_only_one_job_can_run_at_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = self._runner(root)
+            first_job_id = "busy-first"
+            second_job_id = "busy-second"
+            first_stage = self._fake_stage(runner, first_job_id, "hang", timeout_seconds=60)
+            second_stage = self._fake_stage(runner, second_job_id, "success")
+
+            runner.submit([first_stage], job_id=first_job_id)
+            try:
+                self._wait_for(
+                    runner,
+                    first_job_id,
+                    lambda status: status.get("status") == "running",
+                    timeout_seconds=10,
+                )
+                with self.assertRaises(BusyError):
+                    runner.submit([second_stage], job_id=second_job_id)
+            finally:
+                runner.cancel(first_job_id)
+                self._wait_terminal(runner, first_job_id)
+                self._join_job_thread(runner, first_job_id)
+
+    def test_api_rejects_second_job_while_preprocessing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            workspace_root = root / "workspace"
+            Settings(data_dir).accept_notice()
+            app = server_module.create_app(data_dir=data_dir, workspace_root=workspace_root)
+            client = app.test_client()
+            entered = threading.Event()
+            release = threading.Event()
+
+            def slow_preprocess(workspace: str, _uploads: list[tuple[str, str]], **_kwargs: Any) -> dict[str, Any]:
+                entered.set()
+                self.assertTrue(release.wait(10), "slow preprocess was not released")
+                return _ok_manifest(workspace)
+
+            with (
+                patch.object(server_module, "ADAPTER_CLASSES", {"fake": FakeServerAdapter}),
+                patch.object(server_module, "detect_all", return_value={"fake": {"available": True}}),
+                patch.object(server_module, "preprocess_job", side_effect=slow_preprocess),
+            ):
+                first = self._post_fake_job(client)
+                self.assertEqual(first.status_code, 202)
+                job_id = first.get_json()["job_id"]
+                runner = app.extensions["ppt_webtool"]["runner"]()
+                self.assertTrue(entered.wait(5), "preprocess did not start")
+
+                second = self._post_fake_job(client, filename="second.png")
+                self.assertEqual(second.status_code, 503)
+                release.set()
+
+            final = self._wait_terminal(runner, job_id, timeout_seconds=20)
+            self._join_job_thread(runner, job_id)
+            self.assertEqual(final["status"], "done")
+
+    def test_api_cancel_during_preprocessing_stops_active_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            workspace_root = root / "workspace"
+            Settings(data_dir).accept_notice()
+            app = server_module.create_app(data_dir=data_dir, workspace_root=workspace_root)
+            client = app.test_client()
+            child_started = threading.Event()
+            child_pids: list[int] = []
+
+            def child_preprocess(
+                workspace: str,
+                _uploads: list[tuple[str, str]],
+                *,
+                cancel_event: Any | None = None,
+                popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+            ) -> dict[str, Any]:
+                self.assertIsNotNone(popen_factory)
+                assert popen_factory is not None
+                process = popen_factory(
+                    [sys.executable, "-c", "import time; time.sleep(3600)"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                child_pids.append(process.pid)
+                child_started.set()
+                process.communicate()
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("cancelled")
+                return _ok_manifest(workspace)
+
+            with (
+                patch.object(server_module, "ADAPTER_CLASSES", {"fake": FakeServerAdapter}),
+                patch.object(server_module, "detect_all", return_value={"fake": {"available": True}}),
+                patch.object(server_module, "preprocess_job", side_effect=child_preprocess),
+            ):
+                response = self._post_fake_job(client)
+                self.assertEqual(response.status_code, 202)
+                job_id = response.get_json()["job_id"]
+                runner = app.extensions["ppt_webtool"]["runner"]()
+                self.assertTrue(child_started.wait(5), "preprocess child did not start")
+                processing = self._wait_for(
+                    runner,
+                    job_id,
+                    lambda status: status.get("status") == "preprocessing"
+                    and any(event.get("event") == "PROCESS_START" for event in status.get("events", [])),
+                    timeout_seconds=10,
+                )
+                pids = child_pids or [event["pid"] for event in processing["events"] if event.get("event") == "PROCESS_START"]
+
+                cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+                self.assertEqual(cancel_response.status_code, 200)
+                self.assertEqual(cancel_response.get_json()["status"], "cancelled")
+
+            final = self._wait_terminal(runner, job_id, timeout_seconds=10)
+            self._join_job_thread(runner, job_id)
+            final = runner.get_status(job_id)
+            self.assertEqual(final["status"], "cancelled")
+            events = final.get("events", [])
+            self.assertTrue(any(event.get("event") == "TERMINATE" for event in events))
+            for pid in pids:
+                self.assertFalse(self._pid_is_running(int(pid)), f"preprocess child still exists: {pid}")
+
+    def test_pipeline_preprocess_timeout_kills_child_and_releases_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = self._runner(root)
+            job_ctx: dict[str, Any] = {"job_timeout_seconds": 3}
+            job_id = "preprocess-timeout-job"
+            child_started = threading.Event()
+            child_pids: list[int] = []
+
+            def stuck_preprocess() -> dict[str, Any]:
+                popen_factory = job_ctx.get("runner_managed_popen")
+                self.assertTrue(callable(popen_factory))
+                assert callable(popen_factory)
+                process = popen_factory(
+                    [sys.executable, "-c", "import time; time.sleep(3600)"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                child_pids.append(process.pid)
+                child_started.set()
+                time.sleep(30)
+                return _ok_manifest(str(job_ctx["workspace"]))
+
+            def build_no_stages(_manifest: dict[str, Any]) -> list[Stage]:
+                return []
+
+            submitted_job_id = runner.submit_pipeline(
+                preprocess_fn=stuck_preprocess,
+                stages_builder=build_no_stages,
+                job_id=job_id,
+                job_ctx=job_ctx,
+            )
+            self.assertEqual(submitted_job_id, job_id)
+            self.assertTrue(child_started.wait(5), "preprocess child did not start")
+
+            self._wait_terminal(runner, job_id, timeout_seconds=10)
+            self._join_job_thread(runner, job_id)
+            final = runner.get_status(job_id)
+
+            self.assertEqual(final["status"], "failed")
+            self.assertIn("작업 전체 제한 시간", str(final.get("reason")))
+            events = final.get("events", [])
+            self.assertTrue(any(event.get("event") == "JOB_TIMEOUT" for event in events))
+            self.assertTrue(
+                any(
+                    event.get("event") == "TERMINATE" and event.get("reason") == "job_timeout"
+                    for event in events
+                )
+            )
+            self.assertTrue(child_pids)
+            for pid in child_pids:
+                self.assertFalse(self._pid_is_running(int(pid)), f"preprocess child still exists: {pid}")
+
+            next_job_id = "after-preprocess-timeout"
+            runner.submit([], job_id=next_job_id)
+            next_final = self._wait_terminal(runner, next_job_id, timeout_seconds=5)
+            self._join_job_thread(runner, next_job_id)
+            self.assertEqual(next_final["status"], "done")
+
+    def test_ppt_master_path_prefers_bundled_root_then_falls_back_to_source_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            webtool_root = parent / "ppt-webtool"
+            source_root = parent / "ppt-master"
+            webtool_root.mkdir()
+            source_root.mkdir()
+
+            self.assertEqual(resolve_ppt_master_root(webtool_root), source_root)
+
+            bundled_root = webtool_root / "ppt-master"
+            bundled_root.mkdir()
+            self.assertEqual(resolve_ppt_master_root(webtool_root), bundled_root)
+
+    def test_pipeline_timeout_override_is_captured_per_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = self._runner(Path(temp_dir))
+
+            def preprocess() -> dict[str, Any]:
+                return _ok_manifest("unused")
+
+            def build_no_stages(_manifest: dict[str, Any]) -> list[Stage]:
+                return []
+
+            first_job_id = runner.submit_pipeline(
+                preprocess_fn=preprocess,
+                stages_builder=build_no_stages,
+                job_id="first-timeout",
+                job_ctx={"job_timeout_seconds": 17},
+            )
+            self._wait_terminal(runner, first_job_id)
+            self._join_job_thread(runner, first_job_id)
+
+            second_job_id = runner.submit_pipeline(
+                preprocess_fn=preprocess,
+                stages_builder=build_no_stages,
+                job_id="second-timeout",
+            )
+            self._wait_terminal(runner, second_job_id)
+            self._join_job_thread(runner, second_job_id)
+
+            self.assertEqual(runner._jobs[first_job_id].timeout_seconds, 17)
+            self.assertEqual(runner._jobs[second_job_id].timeout_seconds, DEFAULT_TIMEOUT_SECONDS)
+            first_start = next(event for event in runner.get_status(first_job_id)["events"] if event["event"] == "START")
+            second_start = next(event for event in runner.get_status(second_job_id)["events"] if event["event"] == "START")
+            self.assertEqual(first_start["job_timeout_seconds"], 17)
+            self.assertEqual(second_start["job_timeout_seconds"], DEFAULT_TIMEOUT_SECONDS)
+
+    def test_api_success_runs_submit_pipeline_to_done_with_fake_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            workspace_root = root / "workspace"
+            Settings(data_dir).accept_notice()
+            app = server_module.create_app(data_dir=data_dir, workspace_root=workspace_root)
+            client = app.test_client()
+
+            with (
+                patch.object(server_module, "ADAPTER_CLASSES", {"fake": FakeServerAdapter}),
+                patch.object(server_module, "detect_all", return_value={"fake": {"available": True}}),
+            ):
+                response = self._post_fake_job(client)
+                self.assertEqual(response.status_code, 202)
+                job_id = response.get_json()["job_id"]
+                runner = app.extensions["ppt_webtool"]["runner"]()
+                final = self._wait_terminal(runner, job_id, timeout_seconds=20)
+                self._join_job_thread(runner, job_id)
+
+            final = runner.get_status(job_id)
+            self.assertEqual(final["status"], "done")
+            self.assertTrue(final.get("result_files"))
+            self.assertTrue(any(event.get("event") == "PREPROCESS_DONE" for event in final.get("events", [])))
+            self.assertTrue(any(event.get("event") == "STAGES_BUILT" for event in final.get("events", [])))
+
+    def test_raw_absent_validator_passes_after_preprocess_and_fails_on_raw_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace" / "raw-absent-job"
+            upload = root / "notes.txt"
+            upload.write_text("confidential source text\n", encoding="utf-8")
+
+            manifest = preprocess_job(str(workspace), [(str(upload), "notes.txt")])
+            validator = make_raw_absent_validator()
+            ctx = {"project_dir": str(workspace / "project"), "manifest": manifest}
+
+            result = validator(ctx)
+            self.assertTrue(result.ok, result.reason)
+
+            raw_path = Path(str(manifest["uploads"][0]["raw_path"]))
+            shutil.copy2(raw_path, workspace / "project" / "notes.txt")
+            copied_result = validator(ctx)
+            self.assertFalse(copied_result.ok)
+            self.assertIn("원본 파일", str(copied_result.reason))
+
+    def test_security_notice_acceptance_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            settings = Settings(data_dir)
+
+            self.assertFalse(settings.load()["security_notice_accepted"])
+            accepted = settings.accept_notice()
+            self.assertTrue(accepted["security_notice_accepted"])
+            reloaded = Settings(data_dir)
+            self.assertTrue(reloaded.load()["security_notice_accepted"])
+
+    def test_settings_api_redacts_stored_image_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            workspace_root = root / "workspace"
+            secret = "sk-test-redaction-secret"
+            app = server_module.create_app(data_dir=data_dir, workspace_root=workspace_root)
+
+            with patch.object(server_module, "detect_all", return_value={}):
+                client = app.test_client()
+                post_response = client.post(
+                    "/api/settings",
+                    json={"image_api": {"backend": "openai", "key": secret}},
+                )
+                settings_response = client.get("/api/settings")
+                meta_response = client.get("/api/meta")
+
+            self.assertEqual(post_response.status_code, 200)
+            self.assertEqual(settings_response.status_code, 200)
+            self.assertEqual(meta_response.status_code, 200)
+            stored = Settings(data_dir).load()
+            self.assertEqual(stored["image_api"]["key"], secret)
+
+            for response in (post_response, settings_response, meta_response):
+                self.assertNotIn(secret, response.get_data(as_text=True))
+
+            post_json = post_response.get_json()
+            settings_json = settings_response.get_json()
+            meta_json = meta_response.get_json()
+            self.assertEqual(post_json["image_api"], {"backend": "openai", "has_key": True})
+            self.assertEqual(settings_json["image_api"], {"backend": "openai", "has_key": True})
+            self.assertEqual(meta_json["image_api"], {"backend": "openai", "has_key": True})
+            self.assertNotIn("key", post_json["image_api"])
+            self.assertNotIn("key", settings_json["image_api"])
+            self.assertNotIn("key", meta_json["image_api"])
+
+            clear_response = client.post("/api/settings", json={"image_api": {"key": ""}})
+            self.assertEqual(clear_response.status_code, 200)
+            self.assertFalse(clear_response.get_json()["image_api"]["has_key"])
+            self.assertIsNone(Settings(data_dir).load()["image_api"]["key"])
+
+    def test_settings_api_rejects_unsupported_image_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            workspace_root = root / "workspace"
+            app = server_module.create_app(data_dir=data_dir, workspace_root=workspace_root)
+            client = app.test_client()
+
+            response = client.post(
+                "/api/settings",
+                json={"image_api": {"backend": "minimax", "key": "secret"}},
+            )
+
+            self.assertEqual(response.status_code, 400)
+            body = response.get_data(as_text=True)
+            self.assertIn("openai", body)
+            self.assertIn("gemini", body)
+            self.assertIsNone(Settings(data_dir).load()["image_api"]["backend"])
+
+    def test_job_stage_env_uses_ppt_master_image_contract_when_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            workspace_root = root / "workspace"
+            Settings(data_dir).accept_notice()
+            app = server_module.create_app(data_dir=data_dir, workspace_root=workspace_root)
+            client = app.test_client()
+            ImageEnvServerAdapter.captured_envs = []
+            secret = "sk-env-contract"
+
+            def fast_preprocess(workspace: str, _uploads: list[tuple[str, str]], **_kwargs: Any) -> dict[str, Any]:
+                return _ok_manifest(workspace)
+
+            with (
+                patch.object(server_module, "ADAPTER_CLASSES", {"fake": ImageEnvServerAdapter}),
+                patch.object(server_module, "detect_all", return_value={"fake": {"available": True}}),
+                patch.object(server_module, "preprocess_job", side_effect=fast_preprocess),
+            ):
+                incomplete_settings = client.post("/api/settings", json={"image_api": {"backend": "openai"}})
+                self.assertEqual(incomplete_settings.status_code, 200)
+
+                incomplete_response = self._post_fake_job(client, filename="incomplete.png")
+                self.assertEqual(incomplete_response.status_code, 202)
+                incomplete_job_id = incomplete_response.get_json()["job_id"]
+                runner = app.extensions["ppt_webtool"]["runner"]()
+                incomplete_final = self._wait_terminal(runner, incomplete_job_id, timeout_seconds=20)
+                self._join_job_thread(runner, incomplete_job_id)
+                self.assertEqual(incomplete_final["status"], "done")
+
+                configured_settings = client.post(
+                    "/api/settings",
+                    json={"image_api": {"backend": "openai", "key": secret}},
+                )
+                self.assertEqual(configured_settings.status_code, 200)
+
+                configured_response = self._post_fake_job(client, filename="configured.png")
+                self.assertEqual(configured_response.status_code, 202)
+                configured_job_id = configured_response.get_json()["job_id"]
+                configured_final = self._wait_terminal(runner, configured_job_id, timeout_seconds=20)
+                self._join_job_thread(runner, configured_job_id)
+                self.assertEqual(configured_final["status"], "done")
+
+            self.assertEqual(len(ImageEnvServerAdapter.captured_envs), 2)
+            incomplete_env = ImageEnvServerAdapter.captured_envs[0]
+            self.assertNotIn("IMAGE_BACKEND", incomplete_env)
+            self.assertNotIn("OPENAI_API_KEY", incomplete_env)
+            self.assertNotIn("GEMINI_API_KEY", incomplete_env)
+            self.assertNotIn("PPT_WEBTOOL_IMAGE_BACKEND", incomplete_env)
+            self.assertNotIn("PPT_WEBTOOL_IMAGE_API_KEY", incomplete_env)
+
+            configured_env = ImageEnvServerAdapter.captured_envs[1]
+            self.assertEqual(configured_env["IMAGE_BACKEND"], "openai")
+            self.assertEqual(configured_env["OPENAI_API_KEY"], secret)
+            self.assertNotIn("GEMINI_API_KEY", configured_env)
+            self.assertNotIn("PPT_WEBTOOL_IMAGE_BACKEND", configured_env)
+            self.assertNotIn("PPT_WEBTOOL_IMAGE_API_KEY", configured_env)
+
+    def test_invalid_upload_extension_removes_workspace_before_job_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            workspace_root = root / "workspace"
+            Settings(data_dir).accept_notice()
+            app = server_module.create_app(data_dir=data_dir, workspace_root=workspace_root)
+            client = app.test_client()
+            with patch.object(server_module, "detect_all", return_value={"claude": {"available": True}}):
+                response = client.post(
+                    "/api/jobs",
+                    data={
+                        "request_text": "make a deck",
+                        "image_source": "none",
+                        "cli": "claude",
+                        "files": (io.BytesIO(b"unsupported"), "source.bad"),
+                    },
+                    content_type="multipart/form-data",
+                )
+
+            self.assertEqual(response.status_code, 400)
+            remaining_workspaces = sorted(path.name for path in workspace_root.iterdir()) if workspace_root.exists() else []
+            self.assertEqual(remaining_workspaces, [])
+
+    def test_job_store_persist_and_load_record_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = JobStore(Path(temp_dir))
+            payload = {"job_id": "store-test", "status": "queued", "events": []}
+
+            store.persist("store-test", payload, threading.Lock())
+
+            self.assertEqual(store.load_record("store-test"), payload)
+
+    def test_collect_result_files_collects_export_stage_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            export_path = workspace / "project" / "exports" / "deck.pptx"
+            export_path.parent.mkdir(parents=True)
+            export_path.write_bytes(b"pptx")
+            stage = Stage(
+                id="export",
+                kind="export",
+                owner="script",
+                command=[],
+                cwd=str(workspace / "project"),
+                env={},
+                expected_outputs=["exports/**/*.pptx"],
+                validators=[],
+                timeout_seconds=30,
+            )
+
+            self.assertEqual(collect_result_files([stage], workspace), ["project/exports/deck.pptx"])
+    def test_image_intake_copies_png_and_writes_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw_image = root / "pixel.png"
+            raw_image.write_bytes(PNG_1X1)
+            project_dir = root / "workspace" / "image-job" / "project"
+            skipped_master_root = root / "missing-ppt-master"
+
+            result = intake_images([str(raw_image)], str(project_dir), ppt_master_root=str(skipped_master_root))
+
+            images_dir = project_dir / "images"
+            manifest_path = images_dir / "image_manifest.json"
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(images_dir.is_dir())
+            self.assertTrue(manifest_path.is_file())
+            entries = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["source"], "user-provided")
+            self.assertTrue((images_dir / entries[0]["filename"]).is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

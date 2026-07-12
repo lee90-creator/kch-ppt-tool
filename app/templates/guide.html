@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card page-heading">
+  <p class="eyebrow">설치 안내</p>
+  <h1>지원 CLI 설치 및 로그인</h1>
+  <p class="muted">설치 후 같은 터미널 환경에서 로그인까지 완료한 뒤 ppt-webtool 서버를 다시 시작하세요.</p>
+</section>
+
+<section class="guide-grid">
+  <article class="card guide-card">
+    <h2>Claude Code</h2>
+    <p>Anthropic Claude Code CLI를 전역 설치하고 로그인합니다.</p>
+    <div class="command-block">
+      <span>설치</span>
+      <code>npm install -g @anthropic-ai/claude-code</code>
+    </div>
+    <div class="command-block">
+      <span>로그인</span>
+      <code>claude</code>
+      <small class="muted">첫 실행 시 브라우저 인증을 완료합니다. 필요하면 CLI 안에서 /login을 실행합니다.</small>
+    </div>
+  </article>
+
+  <article class="card guide-card">
+    <h2>OpenAI Codex CLI</h2>
+    <p>OpenAI Codex CLI를 설치하고 계정 인증을 완료합니다.</p>
+    <div class="command-block">
+      <span>설치</span>
+      <code>npm install -g @openai/codex</code>
+    </div>
+    <div class="command-block">
+      <span>로그인</span>
+      <code>codex login</code>
+    </div>
+  </article>
+
+  <article class="card guide-card">
+    <h2>Gemini CLI</h2>
+    <p>Google Gemini CLI는 one-shot 실행 안정성을 위해 유료 또는 지원 대상 계정이 필요합니다.</p>
+    <div class="command-block">
+      <span>설치</span>
+      <code>npm install -g @google/gemini-cli</code>
+    </div>
+    <div class="command-block">
+      <span>로그인</span>
+      <code>gemini</code>
+      <small class="muted">시작 후 Google 로그인 방식을 선택합니다. 본 도구의 Gemini one-shot 실행은 유료 또는 지원 대상 계정이 필요합니다.</small>
+    </div>
+  </article>
+</section>
+
+<section class="card checklist">
+  <h2>점검 순서</h2>
+  <ol>
+    <li>필요한 CLI를 설치합니다.</li>
+    <li>동일 사용자 계정에서 로그인 명령을 실행합니다.</li>
+    <li><code>claude --version</code>, <code>codex --version</code>, <code>gemini --version</code> 중 설치한 항목이 정상 출력되는지 확인합니다.</li>
+    <li>ppt-webtool 서버를 재시작하고 생성 화면에서 사용 가능 상태를 확인합니다.</li>
+  </ol>
+</section>
+{% endblock %}

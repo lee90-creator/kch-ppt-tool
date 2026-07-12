@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card page-heading">
+  <p class="eyebrow">설정</p>
+  <div class="page-heading__row">
+    <div>
+      <h1>이미지 백엔드와 서버 관리</h1>
+      <p class="muted">API 키는 저장 여부만 표시되며 화면에 다시 노출되지 않습니다.</p>
+    </div>
+    <span class="version">버전 <strong id="version-label">확인 중</strong></span>
+  </div>
+</section>
+
+<form id="settings-form" class="card form" method="post" novalidate>
+  <div class="form-grid">
+    <label class="field">
+      <span class="field__label">이미지 백엔드</span>
+      <select id="image-backend" name="backend">
+        <option value="">없음</option>
+        <option value="openai">OpenAI</option>
+        <option value="gemini">Gemini</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span class="field__label">API 키</span>
+      <input id="image-key" name="key" type="password" autocomplete="off" placeholder="새 키를 입력하면 저장됩니다">
+      <span id="image-key-state" class="field__help">저장된 키가 없습니다.</span>
+    </label>
+
+    <label class="field">
+      <span class="field__label">Claude 모델 (선택)</span>
+      <input id="claude-model" name="claude_model" type="text" autocomplete="off" placeholder="예: sonnet (비우면 기본 모델)">
+      <span class="field__help">기본 모델이 사용량 한도(예: "Fable 5 limit")에 걸리면 sonnet 등으로 지정하세요.</span>
+    </label>
+
+    <label class="field">
+      <span class="field__label">최대 생성 시간 (분)</span>
+      <input id="job-timeout" name="job_timeout_minutes" type="number" min="10" max="180" step="5" placeholder="60">
+      <span class="field__help">한 건 생성의 제한 시간. claude는 codex보다 느리니 여유를 두세요(기본 60분, 10~180).</span>
+    </label>
+  </div>
+  <div class="form__actions">
+    <button class="button button--primary" type="submit">설정 저장</button>
+    <p id="settings-message" class="form-message" role="status" aria-live="polite"></p>
+  </div>
+</form>
+
+<section class="card danger-zone">
+  <div>
+    <p class="eyebrow">서버 제어</p>
+    <h2>로컬 서버 종료</h2>
+    <p class="muted">현재 브라우저에서 접근 중인 ppt-webtool Flask 서버를 종료합니다.</p>
+  </div>
+  <button id="shutdown-server" class="button button--danger" type="button">서버 종료</button>
+  <p id="shutdown-message" class="form-message" role="status" aria-live="polite"></p>
+</section>
+{% endblock %}

@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card page-heading">
+  <p class="eyebrow">작업 상태</p>
+  <div class="page-heading__row">
+    <div>
+      <h1>작업 진행 상황</h1>
+      <p class="muted">작업 ID: <code id="job-id-label">{{ job_id }}</code></p>
+    </div>
+    <a class="button button--ghost" href="{{ url_for('page_index') }}">새 작업</a>
+  </div>
+</section>
+
+<section class="card">
+  <ol id="job-steps" class="steps" aria-label="작업 단계">
+    <li data-step="queued" class="step is-active"><span>접수</span></li>
+    <li data-step="preprocessing" class="step"><span>전처리</span></li>
+    <li data-step="running" class="step"><span>생성 중</span></li>
+    <li data-step="terminal" class="step"><span id="terminal-step-label">완료/실패/취소</span></li>
+  </ol>
+  <div class="status-panel">
+    <div>
+      <span id="job-status-badge" class="badge">확인 중</span>
+      <p id="job-status-detail" class="status-panel__detail">서버에서 상태를 불러오고 있습니다.</p>
+    </div>
+    <div class="status-panel__actions">
+      <button id="cancel-job" class="button button--danger" type="button">작업 취소</button>
+      <a id="download-job" class="button button--primary" href="/api/jobs/{{ job_id }}/download" hidden>다운로드</a>
+    </div>
+  </div>
+</section>
+
+<section id="failure-panel" class="card failure-panel" hidden>
+  <h2>작업 실패</h2>
+  <p id="failure-reason" class="form-message form-message--error"></p>
+  <div class="button-row">
+    <button id="show-full-log" class="button button--ghost" type="button">로그 전문 보기</button>
+    <a id="retry-job" class="button button--primary" href="{{ url_for('page_index') }}?retry={{ job_id }}">같은 설정으로 재시도</a>
+  </div>
+</section>
+
+<section class="card log-card">
+  <div class="log-card__header">
+    <div>
+      <p class="eyebrow">실시간 로그</p>
+      <h2>콘솔</h2>
+    </div>
+    <button id="pause-log" class="button button--ghost" type="button">일시정지</button>
+  </div>
+  <pre id="job-log" class="log-console" aria-live="polite"></pre>
+</section>
+{% endblock %}

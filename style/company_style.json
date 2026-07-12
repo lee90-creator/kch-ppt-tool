@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "status": "provisional-frozen",
+  "slide_count": 31,
+  "slide_size_emu": {
+    "width": 12192000,
+    "height": 6858000
+  },
+  "_note": "측정 근거(원본 덱의 실제 텍스트 포함)는 회사 기밀이라 저장소에서 제외됨. 런타임은 design_spec_mapping만 사용한다. 전체 근거는 tools/extract_style.py로 회사 덱에서 재생성 가능.",
+  "design_spec_mapping": {
+    "applied_when": "company_style_toggle=on",
+    "not_applied_when": "company_style_toggle=off",
+    "toggle_off_rule": "company_style_toggle=off이면 이 회사 스타일 지시문을 design_spec/spec_lock 프롬프트에 주입하지 않는다.",
+    "header": {
+      "applied_when": "company_style_toggle=on",
+      "prompt_instruction_ko": "본문 슬라이드 헤더는 좌상단 섹션번호 박스를 x 6.96%, y 3.18%, w 9.19%, h 16.16%, 약 66.0pt 굵은 표시로 두고, 섹션 제목은 x 16.15%, y 6.7%, w 24.87%, h 6.73%, 약 24.0pt 굵은 제목으로 배치한다.",
+      "reason": null
+    },
+    "governing_message": {
+      "applied_when": "company_style_toggle=on",
+      "prompt_instruction_ko": "각 본문 슬라이드는 소제목 아래 x 6.0%, y 23.98%, w 89.47%, h 7.85% 위치에 약 16.0pt의 결론 선행 한 문장을 먼저 제시하고, 이후 표·도표·상세 근거를 배치한다.",
+      "reason": null
+    },
+    "colors": {
+      "applied_when": "company_style_toggle=on",
+      "palette_groups": {
+        "primary": {
+          "value": [
+            "#1E49E2",
+            "#00338D",
+            "#0C233C",
+            "#ACEAFF",
+            "#00B8F5",
+            "#7213EA",
+            "#FD349C"
+          ],
+          "reason": null
+        },
+        "accent": {
+          "value": [
+            "#76D2FF",
+            "#510DBC",
+            "#B497FF",
+            "#AB0D82",
+            "#FFA3DA",
+            "#098E7E",
+            "#00C0AE",
+            "#63EBDA"
+          ],
+          "reason": null
+        },
+        "neutral": {
+          "value": [
+            "#333333",
+            "#666666",
+            "#989898",
+            "#B2B2B2",
+            "#E5E5E5"
+          ],
+          "reason": null
+        }
+      },
+      "prompt_instruction_ko": "색상은 실측 팔레트를 우선 사용한다: Primary #1E49E2, #00338D, #0C233C, #ACEAFF, #00B8F5, #7213EA, #FD349C, Accent #76D2FF, #510DBC, #B497FF, #AB0D82, #FFA3DA, #098E7E, #00C0AE, #63EBDA, Neutral #333333, #666666, #989898, #B2B2B2, #E5E5E5. 토글 OFF시 이 HEX 팔레트는 주입하지 않는다.",
+      "reason": null
+    },
+    "fonts": {
+      "applied_when": "company_style_toggle=on",
+      "measured": {
+        "primary_font": "210 옴니고딕OTF 040"
+      },
+      "runtime_font_policy": {
+        "applied_font": "Malgun Gothic",
+        "reason": "실측 주폰트가 비표준 폰트라 배포 환경 호환 위해 대체",
+        "policy_source": "deep-interview 스펙 R8 필드④ (밝은 고딕 계열, 직원 PC 기본 탑재 폰트 제한)"
+      },
+      "prompt_instruction_ko": "타이포그래피는 실측 주폰트를 별도 measured.primary_font에 보존하고, 런타임 생성/적용 시 배포 환경 호환 정책에 따라 'Malgun Gothic'으로 정책 대체한다. 숫자/본문/도표 텍스트도 'Malgun Gothic' 계열의 굵기 변형(Regular/Bold)만 사용한다. 정책 근거: deep-interview 스펙 R8 필드④ (밝은 고딕 계열, 직원 PC 기본 탑재 폰트 제한).",
+      "reason": null
+    },
+    "cover_toc": {
+      "applied_when": "company_style_toggle=on",
+      "prompt_instruction_ko": "표지는 제목 블록을 x 7.22%, y 33.95%, w 85.47%, h 28.16%에 크게 두고 날짜는 'English Month, YYYY' 관례로 표기한다. 목차는 우측 중심 세로 목록과 'Table of Contents' 제목 구조를 따른다.",
+      "reason": null
+    }
+  }
+}
