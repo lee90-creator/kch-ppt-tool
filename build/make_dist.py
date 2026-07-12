@@ -29,6 +29,40 @@ PYTHON_PTH = "\n".join(
     )
 ) + "\n"
 
+# Written into runtime/site-packages so the embeddable interpreter (which forces
+# safe_path via python311._pth and therefore drops the script's own directory
+# from sys.path[0]) can still run bundled ppt-master converters that import
+# sibling modules (e.g. source_to_md/pdf_to_md.py -> _batch).
+SITECUSTOMIZE_PY = '''"""Restore script-directory imports under the Windows embeddable runtime.
+
+The embeddable distribution ships a python311._pth file, which forces
+``safe_path`` and stops Python from prepending the running script's own
+directory to sys.path[0]. Bundled ppt-master converters (e.g.
+source_to_md/pdf_to_md.py) rely on that directory to import sibling
+modules such as ``_batch``. Re-add it to match normal Python behavior.
+"""
+import os
+import sys
+
+
+def _restore_script_dir() -> None:
+    argv = getattr(sys, "argv", None)
+    if not argv:
+        return
+    script = argv[0]
+    if not script:
+        return
+    try:
+        script_dir = os.path.dirname(os.path.abspath(script))
+    except Exception:
+        return
+    if script_dir and os.path.isdir(script_dir) and script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+
+_restore_script_dir()
+'''
+
 IGNORE_COMMON = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache", ".mypy_cache", ".DS_Store")
 PPT_MASTER_EXCLUDED_PATHS = frozenset(
     {
@@ -276,6 +310,7 @@ def assemble_layout(
     extract_python_embed(python_zip, python_embed_dir)
     configure_python_embed(python_embed_dir)
     install_site_packages(requirements, wheels_dir, site_packages)
+    (site_packages / "sitecustomize.py").write_text(SITECUSTOMIZE_PY, encoding="utf-8", newline="\n")
 
     shutil.copy2(webtool_root / "START.bat", package_dir / "START.bat")
     (package_dir / "VERSION").write_text(f"{version_tag}\n", encoding="utf-8", newline="\n")
