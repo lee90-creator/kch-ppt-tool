@@ -12,6 +12,7 @@ from typing import Any
 IMPORT_MODULES = (
     "pptx",
     "flask",
+    "colorama",
     "fitz",
     "PIL",
     "mammoth",
@@ -36,6 +37,7 @@ class PackageCheck:
 PACKAGE_CHECKS = (
     PackageCheck("pptx", ("python-pptx",), ("pptx",)),
     PackageCheck("flask", ("Flask",), ("flask",)),
+    PackageCheck("colorama", ("colorama",), ("colorama",)),
     PackageCheck(
         "fitz",
         ("PyMuPDF",),

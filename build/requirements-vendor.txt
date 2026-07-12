@@ -1,5 +1,8 @@
 python-pptx==1.0.2
 Flask==3.1.3
+# colorama: click imports it for ANSI output on Windows. pip download on Linux drops OS-marker
+# deps, so it must be vendored explicitly or Flask's startup banner crashes the server on Windows.
+colorama==0.4.6
 PyMuPDF==1.24.3
 pillow==12.1.1
 # Removed numpy: the web-tool input contract and native export do not require numerical arrays.
