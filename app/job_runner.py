@@ -14,12 +14,12 @@ from typing import Any, Callable, TextIO
 
 try:  # Package import in the Flask app.
     from .job_store import JobStore
-    from .paths import process_group_popen_kwargs, terminate_process_tree
+    from .paths import process_group_popen_kwargs, resolve_launch_command, terminate_process_tree
     from .results import collect_result_files, load_manifest, preprocess_failure_reason, refresh_manifest
     from .stage_contract import Stage, ValidationResult
 except ImportError:  # Direct module import in small smoke checks.
     from job_store import JobStore
-    from paths import process_group_popen_kwargs, terminate_process_tree
+    from paths import process_group_popen_kwargs, resolve_launch_command, terminate_process_tree
     from results import collect_result_files, load_manifest, preprocess_failure_reason, refresh_manifest
     from stage_contract import Stage, ValidationResult
 
@@ -510,12 +510,15 @@ class JobRunner:
         }
         state_lock = threading.Lock()
 
+        launch_command = resolve_launch_command(stage.command)
+        stdin_mode = subprocess.PIPE if stage.stdin_data is not None else subprocess.DEVNULL
         try:
             process = self._runner_managed_popen(
                 job,
-                stage.command,
+                launch_command,
                 cwd=stage.cwd,
                 env=env,
+                stdin=stdin_mode,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -537,6 +540,12 @@ class JobRunner:
             name=f"job-output-{job.id}-{stage.id}",
         )
         output_thread.start()
+        if stage.stdin_data is not None and process.stdin is not None:
+            try:
+                process.stdin.write(stage.stdin_data)
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
 
         stage_start = time.monotonic()
         kill_reason: str | None = None

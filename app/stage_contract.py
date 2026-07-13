@@ -31,6 +31,7 @@ class Stage:
     expected_outputs: list[str]  # glob, cwd 기준
     validators: list  # Callable[[dict], ValidationResult], dict=job_ctx
     timeout_seconds: int = 1800
+    stdin_data: str | None = None
 
 
 Validator = Callable[[dict[str, Any]], ValidationResult]

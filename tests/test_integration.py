@@ -747,5 +747,88 @@ class IntegrationTest(unittest.TestCase):
             self.assertTrue((images_dir / entries[0]["filename"]).is_file())
 
 
+class LaunchCommandTests(unittest.TestCase):
+    def test_resolves_argv0_to_full_path(self) -> None:
+        from app.paths import resolve_launch_command
+
+        resolved = resolve_launch_command([sys.executable, "exec", "-"])
+        self.assertEqual(resolved[1:], ["exec", "-"])
+        self.assertTrue(Path(resolved[0]).is_file())
+
+    def test_unknown_executable_left_unchanged(self) -> None:
+        from app.paths import resolve_launch_command
+
+        original = ["definitely-not-a-real-cli-xyz", "exec", "-"]
+        self.assertEqual(resolve_launch_command(original), original)
+
+    def test_windows_cmd_shim_wrapped_via_comspec(self) -> None:
+        from app import paths
+
+        fake = r"C:\\Users\\kch\\AppData\\Roaming\\npm\\codex.cmd"
+        with patch.object(paths.shutil, "which", return_value=fake), patch.object(
+            paths.sys, "platform", "win32"
+        ), patch.dict(paths.os.environ, {"COMSPEC": r"C:\\Windows\\System32\\cmd.exe"}):
+            resolved = paths.resolve_launch_command(["codex", "exec", "--sandbox", "-"])
+        self.assertEqual(
+            resolved,
+            [r"C:\\Windows\\System32\\cmd.exe", "/d", "/c", fake, "exec", "--sandbox", "-"],
+        )
+
+    def test_adapter_delivers_prompt_via_stdin_not_argv(self) -> None:
+        from app.cli_adapters import CodexAdapter
+
+        ctx = {"project_dir": "/tmp/x", "image_env": {}, "job_timeout_seconds": 3600}
+        stage = CodexAdapter().build_stages(ctx, "LINE1\nLINE2\nLINE3")[0]
+        self.assertEqual(stage.stdin_data, "LINE1\nLINE2\nLINE3")
+        self.assertEqual(stage.command[-1], "-")
+        self.assertIn("--ignore-user-config", stage.command)
+        self.assertIn("--ephemeral", stage.command)
+        model_flag = stage.command.index("--model")
+        self.assertEqual(stage.command[model_flag + 1], "gpt-5.4")
+        self.assertTrue(all("LINE1" not in part for part in stage.command))
+    def test_gemini_keeps_headless_prompt_flag_with_stdin(self) -> None:
+        from app.cli_adapters import GeminiAdapter
+
+        ctx = {"project_dir": "/tmp/x", "image_env": {}, "job_timeout_seconds": 3600}
+        stage = GeminiAdapter().build_stages(ctx, "PROMPT")[0]
+        prompt_flag = stage.command.index("-p")
+        self.assertEqual(stage.command[prompt_flag + 1], "")
+        self.assertEqual(stage.stdin_data, "PROMPT")
+    def test_job_runner_writes_stage_stdin_to_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project = root / "workspace" / "stdin-job" / "project"
+            project.mkdir(parents=True)
+            output = project / "stdin.txt"
+            command = [
+                sys.executable,
+                "-c",
+                "import pathlib,sys; pathlib.Path('stdin.txt').write_text(sys.stdin.read(), encoding='utf-8')",
+            ]
+            stage = Stage(
+                id="stdin-stage",
+                kind="agent",
+                owner="agent",
+                command=command,
+                cwd=str(project),
+                env={},
+                expected_outputs=[],
+                validators=[],
+                timeout_seconds=10,
+                stdin_data="한글\nMULTILINE\nPROMPT",
+            )
+            runner = JobRunner(root / "workspace", root / "data")
+            runner.submit([stage], job_id="stdin-job")
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                status = runner.get_status("stdin-job")
+                if status["status"] in TERMINAL_STATUSES:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(status["status"], "done", status)
+            self.assertEqual(output.read_text(encoding="utf-8"), "한글\nMULTILINE\nPROMPT")
+
+
 if __name__ == "__main__":
     unittest.main()

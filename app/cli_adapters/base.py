@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..paths import process_group_popen_kwargs, resolve_launch_command
 from ..stage_contract import (
     Stage,
     make_outputs_exist_validator,
@@ -29,6 +30,8 @@ class CliAdapter:
 
     COMMAND_PREFIX: ClassVar[list[str]] = []
     COMMAND_SUFFIX: ClassVar[list[str]] = []
+    # Extra argv appended so the CLI reads the prompt from stdin (e.g. codex "-").
+    STDIN_ARGS: ClassVar[list[str]] = []
     EXTRA_ENV: ClassVar[dict[str, str]] = {}
     NOTE: ClassVar[str | None] = None
 
@@ -64,6 +67,7 @@ class CliAdapter:
                     make_raw_absent_validator(),
                 ],
                 timeout_seconds=stage_timeout,
+                stdin_data=prompt,
             )
         ]
 
@@ -73,7 +77,9 @@ class CliAdapter:
     def _build_command(self, prompt: str, job_ctx: dict[str, Any] | None = None) -> list[str]:
         if not self.COMMAND_PREFIX:
             raise NotImplementedError(f"{self.__class__.__name__}.COMMAND_PREFIX 클래스 상수가 필요합니다")
-        return [*self.COMMAND_PREFIX, prompt, *self.COMMAND_SUFFIX, *self._model_flags(job_ctx or {})]
+        # 프롬프트는 stdin으로 전달하므로 argv에 넣지 않는다(멀티라인/장문 프롬프트의
+        # Windows cmd 인자 파손 방지). argv는 짧은 플래그 + stdin 마커만 포함한다.
+        return [*self.COMMAND_PREFIX, *self.COMMAND_SUFFIX, *self._model_flags(job_ctx or {}), *self.STDIN_ARGS]
 
     def _model_flags(self, job_ctx: dict[str, Any]) -> list[str]:
         """어댑터별 모델 지정 플래그. 기본은 없음(각 CLI 기본 모델 사용)."""
@@ -116,15 +122,15 @@ def detect_cli(
     env["PYTHONUTF8"] = "1"
     try:
         completed = subprocess.run(
-            [path, "--version"],
+            resolve_launch_command([path, "--version"]),
             cwd=str(Path.cwd()),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             timeout=timeout_seconds,
-            start_new_session=True,
             check=False,
+            **process_group_popen_kwargs(),
         )
     except subprocess.TimeoutExpired:
         return AdapterInfo(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -14,6 +15,28 @@ def resolve_ppt_master_root(webtool_root: str | Path) -> Path:
     if bundled_root.exists():
         return bundled_root
     return root.parent / "ppt-master"
+
+
+def resolve_launch_command(command: list[str] | None) -> list[str] | None:
+    """Resolve argv[0] to a concrete executable path.
+
+    On Windows the CLIs (claude/codex/gemini) are installed as npm ``.cmd``
+    shims, which CreateProcess cannot find or run directly (``Popen(["codex"])``
+    fails with WinError 2). Resolve via ``shutil.which`` (honours PATHEXT so the
+    ``.cmd`` is found) and wrap batch shims through ``cmd.exe /c``. Prompts are
+    delivered on stdin, so the wrapped command line stays short and single-line.
+    """
+    if not command:
+        return list(command) if command is not None else None
+    argv = list(command)
+    resolved = shutil.which(argv[0])
+    if resolved is None:
+        return argv
+    rest = argv[1:]
+    if sys.platform == "win32" and resolved.lower().endswith((".cmd", ".bat")):
+        comspec = os.environ.get("COMSPEC") or "cmd.exe"
+        return [comspec, "/d", "/c", resolved, *rest]
+    return [resolved, *rest]
 
 
 def process_group_popen_kwargs() -> dict[str, Any]:
