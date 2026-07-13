@@ -784,9 +784,14 @@ class LaunchCommandTests(unittest.TestCase):
         self.assertIn("--ignore-user-config", stage.command)
         self.assertIn("--ephemeral", stage.command)
         model_flag = stage.command.index("--model")
-        self.assertEqual(stage.command[model_flag + 1], "gpt-5.4")
-        config_flag = stage.command.index("-c")
-        self.assertEqual(stage.command[config_flag + 1], 'windows.sandbox="elevated"')
+        self.assertEqual(stage.command[model_flag + 1], "gpt-5.6-luna")
+        config_values = [
+            stage.command[index + 1]
+            for index, value in enumerate(stage.command[:-1])
+            if value == "-c"
+        ]
+        self.assertIn('windows.sandbox="elevated"', config_values)
+        self.assertIn('model_reasoning_effort="max"', config_values)
         self.assertTrue(all("LINE1" not in part for part in stage.command))
     def test_gemini_keeps_headless_prompt_flag_with_stdin(self) -> None:
         from app.cli_adapters import GeminiAdapter
