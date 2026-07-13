@@ -20,7 +20,7 @@ class ValidationResult:
 class Stage:
     """Immutable v1 stage contract.
 
-    Retry/resume is new-job-only; a stage does not carry resume state.
+    The runner may restart a stage for explicitly recognized transient failures.
     """
     id: str
     kind: str  # "preprocess"|"agent"|"script"|"export"
@@ -32,6 +32,7 @@ class Stage:
     validators: list  # Callable[[dict], ValidationResult], dict=job_ctx
     timeout_seconds: int = 1800
     stdin_data: str | None = None
+    max_retries: int = 0
 
 
 Validator = Callable[[dict[str, Any]], ValidationResult]

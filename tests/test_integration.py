@@ -785,6 +785,8 @@ class LaunchCommandTests(unittest.TestCase):
         self.assertIn("--ephemeral", stage.command)
         model_flag = stage.command.index("--model")
         self.assertEqual(stage.command[model_flag + 1], "gpt-5.4")
+        config_flag = stage.command.index("-c")
+        self.assertEqual(stage.command[config_flag + 1], 'windows.sandbox="elevated"')
         self.assertTrue(all("LINE1" not in part for part in stage.command))
     def test_gemini_keeps_headless_prompt_flag_with_stdin(self) -> None:
         from app.cli_adapters import GeminiAdapter
@@ -794,6 +796,19 @@ class LaunchCommandTests(unittest.TestCase):
         prompt_flag = stage.command.index("-p")
         self.assertEqual(stage.command[prompt_flag + 1], "")
         self.assertEqual(stage.stdin_data, "PROMPT")
+    def test_prompt_pins_runtime_python_executable(self) -> None:
+        from app.prompt_builder import build_prompt
+
+        prompt = build_prompt(
+            {"image_source": "ai", "cli": "codex"},
+            None,
+            "/tmp/ppt-master/SKILL.md",
+            "source.md",
+            python_executable=sys.executable,
+        )
+        self.assertIn(str(Path(sys.executable).resolve()), prompt)
+        self.assertIn("`python`, `python3`, `py` 명령을 사용하지 마십시오.", prompt)
+        self.assertIn("PIL·SVG·도형·스크립트로 이미지를 직접 그려", prompt)
     def test_job_runner_writes_stage_stdin_to_child(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -828,6 +843,47 @@ class LaunchCommandTests(unittest.TestCase):
                 time.sleep(0.05)
             self.assertEqual(status["status"], "done", status)
             self.assertEqual(output.read_text(encoding="utf-8"), "한글\nMULTILINE\nPROMPT")
+
+    def test_job_runner_retries_transient_model_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project = root / "workspace" / "retry-job" / "project"
+            project.mkdir(parents=True)
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "p=Path('attempt.txt'); n=int(p.read_text()) if p.exists() else 0; "
+                    "p.write_text(str(n+1)); "
+                    "print('ERROR: Selected model is at capacity. Please try a different model.' if n == 0 else 'OK'); "
+                    "sys.exit(1 if n == 0 else 0)"
+                ),
+            ]
+            stage = Stage(
+                id="retry-stage",
+                kind="agent",
+                owner="agent",
+                command=command,
+                cwd=str(project),
+                env={},
+                expected_outputs=[],
+                validators=[],
+                timeout_seconds=10,
+                max_retries=1,
+            )
+            runner = JobRunner(root / "workspace", root / "data")
+            runner.submit([stage], job_id="retry-job")
+
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                status = runner.get_status("retry-job")
+                if status["status"] in TERMINAL_STATUSES:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(status["status"], "done", status)
+            self.assertEqual((project / "attempt.txt").read_text(), "2")
+            self.assertTrue(any(event["event"] == "STAGE_RETRY" for event in status["events"]))
 
 
 if __name__ == "__main__":

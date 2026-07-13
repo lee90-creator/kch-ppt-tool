@@ -490,7 +490,14 @@ class JobRunner:
         self._set_terminal(job, "failed", reason)
         return True
 
-    def _run_stage(self, job: _JobState, stage: Stage, job_start: float) -> tuple[bool, str | None, str | None]:
+    def _run_stage(
+        self,
+        job: _JobState,
+        stage: Stage,
+        job_start: float,
+        *,
+        attempt: int = 1,
+    ) -> tuple[bool, str | None, str | None]:
         details = {"stage_id": stage.id, "kind": stage.kind, "owner": stage.owner, "cwd": stage.cwd}
         self._record_event(job, "STAGE_START", details)
         if stage.owner == "agent":
@@ -507,6 +514,7 @@ class JobRunner:
         state: dict[str, Any] = {
             "last_output_time": time.monotonic(),
             "idle_warned": False,
+            "transient_error": False,
         }
         state_lock = threading.Lock()
 
@@ -609,6 +617,26 @@ class JobRunner:
             return False, None, f"{STALL_IDLE_SECONDS}초 동안 출력이 없어 스테이지를 중지했습니다: {stage.id}"
         if kill_reason is not None:
             return False, None, f"스테이지가 중지되었습니다({kill_reason}): {stage.id}"
+        with state_lock:
+            transient_error = bool(state["transient_error"])
+        if (
+            process.returncode != 0
+            and transient_error
+            and attempt <= stage.max_retries
+            and not self._is_cancelled(job)
+        ):
+            self._record_event(
+                job,
+                "STAGE_RETRY",
+                {
+                    "stage_id": stage.id,
+                    "attempt": attempt + 1,
+                    "max_retries": stage.max_retries,
+                    "reason": "transient_model_capacity",
+                },
+            )
+            time.sleep(min(2**attempt, 5))
+            return self._run_stage(job, stage, job_start, attempt=attempt + 1)
         if process.returncode != 0:
             return False, None, f"스테이지가 실패했습니다({stage.id}, exit_code={process.returncode})"
 
@@ -646,6 +674,16 @@ class JobRunner:
                 with state_lock:
                     state["last_output_time"] = time.monotonic()
                     state["idle_warned"] = False
+                    lowered = line.casefold()
+                    if any(
+                        marker in lowered
+                        for marker in (
+                            "selected model is at capacity",
+                            "temporarily unavailable",
+                            "service unavailable",
+                        )
+                    ):
+                        state["transient_error"] = True
                 self._write_log(job, f"[output] {line}")
         finally:
             try:

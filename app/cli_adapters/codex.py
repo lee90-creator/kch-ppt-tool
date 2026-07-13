@@ -14,6 +14,8 @@ class CodexAdapter(CliAdapter):
         "--skip-git-repo-check",
         "--ignore-user-config",
         "--ephemeral",
+        "-c",
+        'windows.sandbox="elevated"',
     ]
     COMMAND_SUFFIX: list[str] = []
     # Codex CLI 0.130 defaults to gpt-5.3-codex, which ChatGPT accounts reject.

@@ -230,6 +230,7 @@ def create_app(
                     style,
                     str(ppt_master_root / "skills" / "ppt-master" / "SKILL.md"),
                     _sources_description(manifest),
+                    python_executable=sys.executable,
                 )
                 stage_ctx = dict(pipeline_ctx)
                 stage_ctx["manifest"] = manifest

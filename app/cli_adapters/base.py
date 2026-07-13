@@ -68,6 +68,7 @@ class CliAdapter:
                 ],
                 timeout_seconds=stage_timeout,
                 stdin_data=prompt,
+                max_retries=1,
             )
         ]
 

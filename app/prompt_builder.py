@@ -20,7 +20,7 @@ _IMAGE_POLICIES = {
     ),
     "ai": (
         "AI 이미지 생성(스킬 기본 체인)",
-        "이미지가 필요하면 PPT Master 스킬의 기본 AI 이미지 생성 체인을 따르십시오. 임의의 외부 이미지 검색으로 대체하지 마십시오.",
+        "이미지가 필요하면 PPT Master 스킬의 기본 AI 이미지 생성 체인을 따르십시오. 임의의 외부 이미지 검색으로 대체하지 마십시오. 호스트 네이티브 AI 이미지 도구 또는 설정된 이미지 API만 사용하십시오. PIL·SVG·도형·스크립트로 이미지를 직접 그려 AI 생성 이미지라고 표시하는 행위는 금지합니다. 실제 AI 이미지 생성 도구를 사용할 수 없으면 명확한 실패 사유를 출력하고 작업을 실패 처리하십시오.",
     ),
 }
 
@@ -63,7 +63,14 @@ def _company_style_block(style: dict[str, Any]) -> str:
     return "[회사 스타일 규칙]\n" + "\n".join(lines)
 
 
-def build_prompt(form: dict, style: dict | None, skill_md_path: str, sources_desc: str) -> str:
+def build_prompt(
+    form: dict,
+    style: dict | None,
+    skill_md_path: str,
+    sources_desc: str,
+    *,
+    python_executable: str | None = None,
+) -> str:
     """Build the headless PPT Master prompt from web form values."""
 
     request_text = _text(form.get("request_text"), "제공된 입력 자료를 바탕으로 경영진 보고용 PPT를 생성하십시오.")
@@ -77,6 +84,7 @@ def build_prompt(form: dict, style: dict | None, skill_md_path: str, sources_des
     company_style_state = "적용" if company_style_enabled else "미적용"
     skill_abs_path = _absolute_path(skill_md_path)
     source_text = _text(sources_desc, "전처리된 입력 자료를 사용하십시오.")
+    python_abs_path = _absolute_path(python_executable) if python_executable else ""
     style_block = _company_style_block(style) if company_style_enabled and style is not None else ""
 
     blocks = [
@@ -87,6 +95,7 @@ def build_prompt(form: dict, style: dict | None, skill_md_path: str, sources_des
 - 입력 설명: {source_text}
 - 사용자 요청: {request_text}
 - 프로젝트 경로: {PROJECT_PATH}
+- Python 실행파일 절대경로: {python_abs_path or "현재 환경의 Python"}
 
 사전 확정 디자인 스펙:
 - [Template] {DEFAULT_TEMPLATE}
@@ -107,7 +116,8 @@ def build_prompt(form: dict, style: dict | None, skill_md_path: str, sources_des
 2. 모든 BLOCKING 확인 게이트는 위 사전 확정 디자인 스펙값으로 이미 선응답된 것으로 간주하고 즉시 진행하십시오. 이는 스킬 규칙 2의 확인 대기 동작을 오버라이드합니다.
 3. confirm_ui 서버(포트 5050)를 절대 기동하지 마십시오. 확인이 필요하면 "just confirm in chat" 경로로 자체 확정하고 계속 진행하십시오.
 4. 프로젝트는 반드시 {PROJECT_PATH} 에 생성하십시오. 다른 프로젝트 경로를 만들지 마십시오.
-5. {image_rule}
-6. 마지막에는 {PROJECT_PATH}/exports/*.pptx 산출을 완료한 뒤, 완성된 PPTX의 절대경로를 한 줄로 출력하십시오."""
+5. 모든 Python 스크립트는 반드시 위 Python 실행파일 절대경로로 실행하십시오. `python`, `python3`, `py` 명령을 사용하지 마십시오.
+6. {image_rule}
+7. 마지막에는 {PROJECT_PATH}/exports/*.pptx 산출을 완료한 뒤, 완성된 PPTX의 절대경로를 한 줄로 출력하십시오."""
     )
     return "\n\n".join(blocks) + "\n"
