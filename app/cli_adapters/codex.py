@@ -26,4 +26,11 @@ class CodexAdapter(CliAdapter):
     # `-`는 codex exec가 stdin에서 지시문을 읽게 한다.
     def _model_flags(self, job_ctx: dict[str, object]) -> list[str]:
         return ["-c", self.REASONING_CONFIG, "--model", self.DEFAULT_MODEL]
+
+    def runtime_info(self, job_ctx: dict[str, object]) -> dict[str, str | None]:
+        return {
+            "cli": self.name,
+            "model": self.DEFAULT_MODEL,
+            "reasoning_effort": "max",
+        }
     STDIN_ARGS = ["-"]

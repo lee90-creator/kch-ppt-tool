@@ -27,3 +27,12 @@ class ClaudeAdapter(CliAdapter):
         if isinstance(model, str) and model.strip():
             return ["--model", model.strip()]
         return []
+
+    def runtime_info(self, job_ctx: dict[str, Any]) -> dict[str, str | None]:
+        model = job_ctx.get("cli_model")
+        selected_model = model.strip() if isinstance(model, str) and model.strip() else None
+        return {
+            "cli": self.name,
+            "model": selected_model,
+            "reasoning_effort": None,
+        }

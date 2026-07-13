@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import socket
 import sys
 import tempfile
 import threading
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app import server as server_module
+from app import job_runner as job_runner_module
 from app.images.intake import intake_images
 from app.job_runner import BusyError, DEFAULT_TIMEOUT_SECONDS, JobRunner
 from app.job_store import JobStore
@@ -29,7 +31,7 @@ from app.stage_contract import (
     make_pptx_valid_validator,
     make_raw_absent_validator,
 )
-from app.storage import Settings
+from app.storage import History, Settings
 
 
 TERMINAL_STATUSES = {"done", "failed", "cancelled"}
@@ -249,6 +251,29 @@ class IntegrationTest(unittest.TestCase):
             self.assertTrue(any(event.get("event") == "PROCESS_EXIT" for event in events))
             for pid in pids:
                 self.assertFalse(self._pid_is_running(int(pid)), f"process still exists: {pid}")
+
+    def test_running_job_heartbeat_updates_idle_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = self._runner(Path(temp_dir))
+            job_id = "heartbeat-job"
+            stage = self._fake_stage(runner, job_id, "hang", timeout_seconds=30)
+            try:
+                with patch.object(job_runner_module, "HEARTBEAT_INTERVAL_SECONDS", 0.05):
+                    runner.submit([stage], job_id=job_id)
+                    status = self._wait_for(
+                        runner,
+                        job_id,
+                        lambda current: int((current.get("progress") or {}).get("idle_seconds") or 0) >= 1,
+                        timeout_seconds=5,
+                    )
+                progress = status["progress"]
+                self.assertEqual(progress["phase"], "generating")
+                self.assertIn("실행 중", progress["detail"])
+                self.assertTrue(progress["last_activity_at"])
+            finally:
+                runner.cancel(job_id)
+                self._wait_terminal(runner, job_id)
+                self._join_job_thread(runner, job_id)
 
     def test_hang_job_times_out(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -499,6 +524,164 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(first_start["job_timeout_seconds"], 17)
             self.assertEqual(second_start["job_timeout_seconds"], DEFAULT_TIMEOUT_SECONDS)
 
+    def test_port_probe_skips_an_existing_listener(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind((server_module.HOST, 0))
+            listener.listen()
+            occupied_port = int(listener.getsockname()[1])
+            selected = server_module._find_available_port(
+                host=server_module.HOST,
+                start_port=occupied_port,
+                max_increment=10,
+            )
+
+        self.assertNotEqual(selected, occupied_port)
+        self.assertGreater(selected, occupied_port)
+
+    def test_existing_instance_action_reuses_same_release_and_blocks_conflict(self) -> None:
+        current_root = Path("/tmp/current-release")
+        same = {
+            "version": "0.0.5",
+            "instance_root": str(current_root),
+            "_url": "http://127.0.0.1:8765",
+        }
+        conflict = {
+            "version": "0.0.4",
+            "instance_root": "/tmp/old-release",
+            "_url": "http://127.0.0.1:8765",
+        }
+
+        self.assertEqual(
+            server_module._existing_instance_action(
+                same,
+                current_version="0.0.5",
+                current_root=current_root,
+            ),
+            ("reuse", "http://127.0.0.1:8765"),
+        )
+        self.assertEqual(
+            server_module._existing_instance_action(
+                conflict,
+                current_version="0.0.5",
+                current_root=current_root,
+            ),
+            ("conflict", "http://127.0.0.1:8765"),
+        )
+    def test_server_instance_lock_is_exclusive_and_preserves_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = Path(temp_dir) / "server.lock"
+            first = server_module.ServerInstanceLock(lock_path)
+            second = server_module.ServerInstanceLock(lock_path)
+            self.assertTrue(first.acquire())
+            try:
+                identity = {"version": "0.0.5", "_url": "http://127.0.0.1:8765"}
+                first.write_identity(identity)
+                self.assertFalse(second.acquire())
+                self.assertEqual(second.read_identity(), identity)
+            finally:
+                first.release()
+
+            self.assertTrue(second.acquire())
+            second.release()
+
+    def test_existing_release_probe_checks_secondary_ports(self) -> None:
+        def fake_probe(*, host: str, port: int, timeout_seconds: float) -> dict[str, Any] | None:
+            self.assertEqual(host, server_module.HOST)
+            self.assertGreater(timeout_seconds, 0)
+            if port == server_module.DEFAULT_PORT + 2:
+                return {"version": "0.0.4", "_url": f"http://{host}:{port}"}
+            return None
+
+        with (
+            patch.object(server_module, "_port_has_listener", return_value=True),
+            patch.object(server_module, "_probe_existing_instance", side_effect=fake_probe) as probe,
+        ):
+            existing = server_module._probe_existing_release(max_increment=3)
+
+        self.assertEqual(existing["version"], "0.0.4")
+        self.assertEqual(probe.call_count, 3)
+
+    def test_identity_api_does_not_detect_cli_and_shutdown_requires_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app = server_module.create_app(data_dir=root / "data", workspace_root=root / "workspace")
+            client = app.test_client()
+
+            with patch.object(server_module, "detect_all", side_effect=AssertionError("CLI detection must not run")):
+                identity_response = client.get("/api/identity")
+
+            self.assertEqual(identity_response.status_code, 200)
+            self.assertEqual(identity_response.get_json()["app_id"], "kch-ppt-tool")
+            self.assertEqual(client.post("/api/shutdown").status_code, 403)
+
+            token = app.config["INSTANCE_TOKEN"]
+            current_runner = app.extensions["ppt_webtool"]["runner"]()
+            with patch.object(current_runner, "is_busy", return_value=True):
+                busy_response = client.post("/api/shutdown", headers={"X-KCH-Instance": token})
+            self.assertEqual(busy_response.status_code, 409)
+
+            shutdown_called = threading.Event()
+            app.extensions["ppt_webtool"]["shutdown_server"] = shutdown_called.set
+            response = client.post("/api/shutdown", headers={"X-KCH-Instance": token})
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(shutdown_called.wait(1))
+
+    def test_log_tail_starts_at_line_boundary_and_chunking_loses_no_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = self._runner(Path(temp_dir))
+            job_id = "large-log-job"
+            log_path = runner.workspace_root / job_id / "job.log"
+            log_path.parent.mkdir(parents=True)
+            expected = [f"line-{index:05d}" for index in range(10000)]
+            log_path.write_text("\n".join(expected) + "\n", encoding="utf-8")
+
+            offset = runner.initial_log_offset(job_id, 4096)
+            received: list[str] = []
+            while True:
+                next_offset, chunk = runner.iter_log(job_id, offset)
+                received.extend(chunk)
+                if next_offset == offset:
+                    break
+                offset = next_offset
+
+            self.assertTrue(received)
+            start = expected.index(received[0])
+            self.assertEqual(received, expected[start:])
+
+
+    def test_artifact_progress_reports_image_and_slide_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir) / "project"
+            deck = project_dir / "projects" / "deck"
+            images = deck / "images"
+            svg_output = deck / "svg_output"
+            svg_final = deck / "svg_final"
+            images.mkdir(parents=True)
+            svg_output.mkdir()
+            svg_final.mkdir()
+            (deck / "exports").mkdir()
+            (deck / "design_spec.md").write_text(
+                "| **Page Count** | 9 |\n",
+                encoding="utf-8",
+            )
+            (images / "image_prompts.json").write_text(
+                json.dumps({"items": [{"filename": "cover.png"}]}),
+                encoding="utf-8",
+            )
+            (images / "cover.png").write_bytes(PNG_1X1)
+            (svg_output / "01.svg").write_text("<svg/>", encoding="utf-8")
+            (svg_output / "02.svg").write_text("<svg/>", encoding="utf-8")
+            (svg_final / "01.svg").write_text("<svg/>", encoding="utf-8")
+
+            progress = job_runner_module._artifact_progress(project_dir)
+
+        self.assertTrue(progress["project_ready"])
+        self.assertTrue(progress["design_ready"])
+        self.assertEqual(progress["total_slides"], 9)
+        self.assertEqual(progress["ai_images_total"], 1)
+        self.assertEqual(progress["ai_images_ready"], 1)
+        self.assertEqual(progress["slides_created"], 2)
+        self.assertEqual(progress["slides_finalized"], 1)
     def test_api_success_runs_submit_pipeline_to_done_with_fake_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -524,6 +707,14 @@ class IntegrationTest(unittest.TestCase):
             self.assertTrue(final.get("result_files"))
             self.assertTrue(any(event.get("event") == "PREPROCESS_DONE" for event in final.get("events", [])))
             self.assertTrue(any(event.get("event") == "STAGES_BUILT" for event in final.get("events", [])))
+
+            self.assertEqual(final["runtime"]["cli"], "fake")
+            self.assertEqual(final["runtime"]["version"], server_module._read_version(server_module._WEBTOOL_ROOT, server_module._REPO_ROOT))
+            self.assertEqual(final["progress"]["phase"], "done")
+            log_response = client.get(f"/api/jobs/{job_id}/log")
+            self.assertEqual(log_response.status_code, 200)
+            self.assertIn("PROCESS_EXIT", log_response.get_data(as_text=True))
+            log_response.close()
 
     def test_raw_absent_validator_passes_after_preprocess_and_fails_on_raw_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -588,6 +779,10 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(post_json["image_api"], {"backend": "openai", "has_key": True})
             self.assertEqual(settings_json["image_api"], {"backend": "openai", "has_key": True})
             self.assertEqual(meta_json["image_api"], {"backend": "openai", "has_key": True})
+            self.assertEqual(meta_json["app_id"], "kch-ppt-tool")
+            self.assertEqual(meta_json["version"], server_module._read_version(server_module._WEBTOOL_ROOT, server_module._REPO_ROOT))
+            self.assertEqual(meta_json["instance_root"], str(server_module._WEBTOOL_ROOT))
+            self.assertEqual(meta_json["server_port"], server_module.DEFAULT_PORT)
             self.assertNotIn("key", post_json["image_api"])
             self.assertNotIn("key", settings_json["image_api"])
             self.assertNotIn("key", meta_json["image_api"])
@@ -706,7 +901,79 @@ class IntegrationTest(unittest.TestCase):
             store.persist("store-test", payload, threading.Lock())
 
             self.assertEqual(store.load_record("store-test"), payload)
+    def test_persist_serializes_snapshot_order_across_terminal_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = self._runner(Path(temp_dir))
+            workspace = runner.workspace_root / "persist-race"
+            workspace.mkdir(parents=True)
+            job = job_runner_module._JobState(
+                id="persist-race",
+                workspace=workspace,
+                raw_dir=workspace / "_raw",
+                project_dir=workspace / "project",
+                log_path=workspace / "job.log",
+                stages=[],
+                manifest=None,
+                record={"job_id": "persist-race", "status": "running", "events": []},
+            )
+            running_persist_started = threading.Event()
+            release_running_persist = threading.Event()
+            original_persist = runner._store.persist
 
+            def delayed_persist(job_id: str, payload: dict[str, Any], persist_lock: Any) -> None:
+                if payload.get("status") == "running":
+                    running_persist_started.set()
+                    self.assertTrue(release_running_persist.wait(2))
+                original_persist(job_id, payload, persist_lock)
+
+            with patch.object(runner._store, "persist", side_effect=delayed_persist):
+                running_thread = threading.Thread(target=runner._persist_job, args=(job,))
+                running_thread.start()
+                self.assertTrue(running_persist_started.wait(1))
+
+                with job.lock:
+                    job.record["status"] = "cancelled"
+                terminal_thread = threading.Thread(target=runner._persist_job, args=(job,))
+                terminal_thread.start()
+                time.sleep(0.1)
+                release_running_persist.set()
+                running_thread.join(2)
+                terminal_thread.join(2)
+
+            self.assertFalse(running_thread.is_alive())
+            self.assertFalse(terminal_thread.is_alive())
+            self.assertEqual(runner._store.load_record("persist-race")["status"], "cancelled")
+
+    def test_history_append_upserts_concurrent_terminal_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history = History(temp_dir)
+            failures: list[Exception] = []
+
+            def append_status(index: int) -> None:
+                try:
+                    history.append(
+                        {
+                            "job_id": "same-job",
+                            "created_at": "2026-07-13T00:00:00+00:00",
+                            "status": "done" if index % 2 else "failed",
+                            "cli": "codex",
+                            "result_files": [f"deck-{index}.pptx"],
+                            "workspace": "workspace/same-job",
+                        }
+                    )
+                except Exception as exc:  # pragma: no cover - asserted below.
+                    failures.append(exc)
+
+            threads = [threading.Thread(target=append_status, args=(index,)) for index in range(20)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(failures, [])
+            records = history.list()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["job_id"], "same-job")
     def test_collect_result_files_collects_export_stage_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir) / "workspace"
@@ -790,6 +1057,9 @@ class LaunchCommandTests(unittest.TestCase):
             for index, value in enumerate(stage.command[:-1])
             if value == "-c"
         ]
+        runtime = CodexAdapter().runtime_info(ctx)
+        self.assertEqual(runtime["model"], "gpt-5.6-luna")
+        self.assertEqual(runtime["reasoning_effort"], "max")
         self.assertIn('windows.sandbox="elevated"', config_values)
         self.assertIn('model_reasoning_effort="max"', config_values)
         self.assertTrue(all("LINE1" not in part for part in stage.command))

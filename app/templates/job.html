@@ -12,7 +12,7 @@
   </div>
 </section>
 
-<section class="card">
+<section class="card status-card">
   <ol id="job-steps" class="steps" aria-label="작업 단계">
     <li data-step="queued" class="step is-active"><span>접수</span></li>
     <li data-step="preprocessing" class="step"><span>전처리</span></li>
@@ -20,7 +20,7 @@
     <li data-step="terminal" class="step"><span id="terminal-step-label">완료/실패/취소</span></li>
   </ol>
   <div class="status-panel">
-    <div>
+    <div id="job-status-summary" role="status" aria-live="polite" aria-atomic="true">
       <span id="job-status-badge" class="badge">확인 중</span>
       <p id="job-status-detail" class="status-panel__detail">서버에서 상태를 불러오고 있습니다.</p>
     </div>
@@ -29,13 +29,51 @@
       <a id="download-job" class="button button--primary" href="/api/jobs/{{ job_id }}/download" hidden>다운로드</a>
     </div>
   </div>
+  <div id="job-progress-panel" class="job-progress" hidden aria-labelledby="job-progress-heading">
+    <div class="job-progress__header">
+      <h2 id="job-progress-heading">생성 상세 진행</h2>
+      <p id="job-progress-text" class="job-progress__text"></p>
+    </div>
+    <div
+      id="job-progress-bar"
+      class="progress-bar is-indeterminate"
+      role="progressbar"
+      aria-label="생성 상세 진행"
+      aria-valuetext="진행 정보를 기다리고 있습니다."
+    >
+      <span id="job-progress-bar-value" class="progress-bar__value"></span>
+    </div>
+  </div>
 </section>
 
-<section id="failure-panel" class="card failure-panel" hidden>
+<section id="job-runtime-panel" class="card runtime-card" hidden aria-labelledby="job-runtime-heading">
+  <p class="eyebrow">실행 환경</p>
+  <h2 id="job-runtime-heading">작업 런타임</h2>
+  <dl class="runtime-details">
+    <div>
+      <dt>버전</dt>
+      <dd id="job-runtime-version">-</dd>
+    </div>
+    <div>
+      <dt>CLI</dt>
+      <dd id="job-runtime-cli">-</dd>
+    </div>
+    <div>
+      <dt>모델</dt>
+      <dd id="job-runtime-model">-</dd>
+    </div>
+    <div>
+      <dt>추론 수준</dt>
+      <dd id="job-runtime-reasoning-effort">-</dd>
+    </div>
+  </dl>
+  <p id="job-runtime-package-root" class="runtime-card__package-root"></p>
+</section>
+
+<section id="failure-panel" class="card failure-panel" role="alert" hidden>
   <h2>작업 실패</h2>
   <p id="failure-reason" class="form-message form-message--error"></p>
   <div class="button-row">
-    <button id="show-full-log" class="button button--ghost" type="button">로그 전문 보기</button>
     <a id="retry-job" class="button button--primary" href="{{ url_for('page_index') }}?retry={{ job_id }}">같은 설정으로 재시도</a>
   </div>
 </section>
@@ -46,8 +84,18 @@
       <p class="eyebrow">실시간 로그</p>
       <h2>콘솔</h2>
     </div>
-    <button id="pause-log" class="button button--ghost" type="button">일시정지</button>
+    <div class="log-card__actions">
+      <a
+        id="open-raw-log"
+        class="button button--ghost"
+        href="/api/jobs/{{ job_id }}/log"
+        target="_blank"
+        rel="noopener"
+      >원본 로그 열기</a>
+      <button id="show-full-log" class="button button--ghost" type="button" aria-controls="job-log" aria-expanded="false">로그 크게 보기</button>
+      <button id="pause-log" class="button button--ghost" type="button" aria-controls="job-log" aria-pressed="false">일시정지</button>
+    </div>
   </div>
-  <pre id="job-log" class="log-console" aria-live="polite"></pre>
+  <pre id="job-log" class="log-console" aria-label="실시간 작업 로그"></pre>
 </section>
 {% endblock %}

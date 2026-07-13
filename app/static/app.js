@@ -402,32 +402,136 @@
     const downloadButton = $("#download-job");
     const statusBadge = $("#job-status-badge");
     const statusDetail = $("#job-status-detail");
+    const progressPanel = $("#job-progress-panel");
+    const progressText = $("#job-progress-text");
+    const progressBar = $("#job-progress-bar");
+    const progressBarValue = $("#job-progress-bar-value");
+    const runtimePanel = $("#job-runtime-panel");
+    const runtimeVersion = $("#job-runtime-version");
+    const runtimeCli = $("#job-runtime-cli");
+    const runtimeModel = $("#job-runtime-model");
+    const runtimeReasoningEffort = $("#job-runtime-reasoning-effort");
+    const runtimePackageRoot = $("#job-runtime-package-root");
     const failurePanel = $("#failure-panel");
     const failureReason = $("#failure-reason");
     const fullLogButton = $("#show-full-log");
     const terminalLabel = $("#terminal-step-label");
-    const queuedLogs = [];
+    const MAX_LOG_LINES = 800;
+    const MAX_LOG_CHARACTERS = 200000;
+    const LOG_TRUNCATION_NOTICE = "이전 로그는 화면에서 생략됨 — 원본 로그에서 확인";
+    const visibleLogs = { lines: [], truncated: false, characters: 0 };
+    const queuedLogs = { lines: [], truncated: false, characters: 0 };
     let paused = false;
     let lastStatus = null;
     let eventSource = null;
     let pollTimer = null;
     let pollInFlight = false;
+    let logRenderScheduled = false;
+    let logIngestScheduled = false;
+    const pendingLogs = { lines: [], truncated: false, characters: 0 };
 
-    function appendLog(line) {
-      if (!log) return;
-      const text = String(line || "");
-      if (paused) {
-        queuedLogs.push(text);
-        pauseButton.textContent = `다시 시작 (${queuedLogs.length})`;
-        return;
+    function logStateText(state) {
+      const content = state.lines.join("\n");
+      if (!state.truncated) return content;
+      return content ? `${LOG_TRUNCATION_NOTICE}\n${content}` : LOG_TRUNCATION_NOTICE;
+    }
+
+    function trimLogState(state) {
+      while (
+        state.lines.length > MAX_LOG_LINES
+        || state.characters + (state.truncated ? LOG_TRUNCATION_NOTICE.length + 1 : 0) > MAX_LOG_CHARACTERS
+      ) {
+        state.truncated = true;
+        if (state.lines.length > 1) {
+          const removed = state.lines.shift();
+          state.characters = Math.max(0, state.characters - removed.length - 1);
+          continue;
+        }
+
+        if (!state.lines.length) break;
+        const maximumLineLength = Math.max(0, MAX_LOG_CHARACTERS - LOG_TRUNCATION_NOTICE.length - 1);
+        const previous = state.lines[0];
+        const trimmed = previous.slice(-maximumLineLength);
+        state.lines[0] = trimmed;
+        state.characters = Math.max(0, state.characters - previous.length + trimmed.length);
+        break;
       }
-      log.textContent += `${text}\n`;
+    }
+
+    function appendLogText(state, value) {
+      const text = value === undefined || value === null ? "" : String(value);
+      for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
+        state.lines.push(line);
+        state.characters += line.length + 1;
+      }
+      trimLogState(state);
+    }
+
+    function renderLog() {
+      logRenderScheduled = false;
+      if (!log) return;
+      log.textContent = logStateText(visibleLogs);
       log.scrollTop = log.scrollHeight;
     }
 
+    function scheduleLogRender() {
+      if (logRenderScheduled) return;
+      logRenderScheduled = true;
+      if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(renderLog);
+      else window.setTimeout(renderLog, 0);
+    }
+    function flushIncomingLogs() {
+      logIngestScheduled = false;
+      if (!pendingLogs.lines.length && !pendingLogs.truncated) return;
+
+      const target = paused ? queuedLogs : visibleLogs;
+      target.truncated = target.truncated || pendingLogs.truncated;
+      target.lines.push(...pendingLogs.lines);
+      target.characters += pendingLogs.characters;
+      pendingLogs.lines.length = 0;
+      pendingLogs.truncated = false;
+      pendingLogs.characters = 0;
+      trimLogState(target);
+
+      if (paused) updatePauseButton();
+      else scheduleLogRender();
+    }
+
+    function scheduleLogIngest() {
+      if (logIngestScheduled) return;
+      logIngestScheduled = true;
+      if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(flushIncomingLogs);
+      else window.setTimeout(flushIncomingLogs, 0);
+    }
+
+    function updatePauseButton() {
+      if (!pauseButton) return;
+      pauseButton.setAttribute("aria-pressed", String(paused));
+      if (!paused) {
+        pauseButton.textContent = "일시정지";
+        return;
+      }
+
+      const count = queuedLogs.lines.length;
+      const suffix = queuedLogs.truncated ? "+" : "";
+      pauseButton.textContent = count ? `다시 시작 (${count}${suffix})` : "다시 시작";
+    }
+
+    function appendLog(line) {
+      appendLogText(pendingLogs, line);
+      scheduleLogIngest();
+    }
+
     function flushLogs() {
-      if (!queuedLogs.length) return;
-      for (const line of queuedLogs.splice(0)) appendLog(line);
+      if (!queuedLogs.lines.length && !queuedLogs.truncated) return;
+      visibleLogs.truncated = visibleLogs.truncated || queuedLogs.truncated;
+      visibleLogs.lines.push(...queuedLogs.lines);
+      visibleLogs.characters += queuedLogs.characters;
+      queuedLogs.lines.length = 0;
+      queuedLogs.truncated = false;
+      queuedLogs.characters = 0;
+      trimLogState(visibleLogs);
+      scheduleLogRender();
     }
 
     function isTerminalStatus(status) {
@@ -478,60 +582,270 @@
       }
     }
 
-    function updateSteps(status) {
+    function updateSteps(statusRecord) {
       const steps = $$("#job-steps .step");
-      const order = ["queued", "preprocessing", "running", "terminal"];
-      let activeIndex = 0;
-      if (status === "preprocessing") activeIndex = 1;
-      else if (status === "running") activeIndex = 2;
-      else if (TERMINAL_STATUSES.has(status)) activeIndex = 3;
+      const record = objectValue(statusRecord) || {};
+      const status = String(record.status || "unknown");
+      const events = Array.isArray(record.events) ? record.events : [];
+      const currentStage = textValue(record.current_stage);
+      const terminal = TERMINAL_STATUSES.has(status);
+      let reachedIndex = 0;
 
-      if (terminalLabel) terminalLabel.textContent = TERMINAL_STATUSES.has(status) ? statusLabel(status) : "완료/실패/취소";
+      if (
+        status === "preprocessing"
+        || events.some((event) => ["PREPROCESS_START", "PREPROCESS_DONE"].includes(String(event && event.event)))
+      ) {
+        reachedIndex = 1;
+      }
+      if (
+        status === "running"
+        || (currentStage && currentStage !== "preprocess")
+        || events.some((event) => String(event && event.event) === "STAGE_START")
+      ) {
+        reachedIndex = 2;
+      }
+      if (status === "done") reachedIndex = 2;
+
+      const activeIndex = terminal ? 3 : status === "running" ? 2 : status === "preprocessing" ? 1 : 0;
+      if (terminalLabel) terminalLabel.textContent = terminal ? statusLabel(status) : "완료/실패/취소";
+
       steps.forEach((step, index) => {
         step.classList.remove("is-active", "is-done", "is-failed", "is-cancelled");
-        if (TERMINAL_STATUSES.has(status)) {
-          if (index < 3) step.classList.add("is-done");
-          if (index === 3) step.classList.add(status === "done" ? "is-done" : status === "cancelled" ? "is-cancelled" : "is-failed");
-          return;
+        step.removeAttribute("aria-current");
+        let stateLabel = "대기";
+
+        if (terminal) {
+          if ((status === "done" && index < 3) || (status !== "done" && index < reachedIndex)) {
+            step.classList.add("is-done");
+            stateLabel = "완료";
+          }
+          if (index === 3) {
+            step.classList.add(status === "done" ? "is-done" : status === "cancelled" ? "is-cancelled" : "is-failed");
+            step.setAttribute("aria-current", "step");
+            stateLabel = statusLabel(status);
+          }
+        } else {
+          if (index < activeIndex) {
+            step.classList.add("is-done");
+            stateLabel = "완료";
+          }
+          if (index === activeIndex) {
+            step.classList.add("is-active");
+            step.setAttribute("aria-current", "step");
+            stateLabel = "현재 단계";
+          }
         }
-        if (index < activeIndex) step.classList.add("is-done");
-        if (order[index] === order[activeIndex]) step.classList.add("is-active");
+
+        step.setAttribute("aria-label", `${step.textContent.trim()}: ${stateLabel}`);
       });
     }
 
+    function textValue(value) {
+      if (typeof value === "string") return value.trim();
+      if (typeof value === "number" || typeof value === "boolean") return String(value);
+      return "";
+    }
+
+    function objectValue(value) {
+      return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+    }
+
+    function numberValue(value) {
+      if (value === null || value === undefined || (typeof value === "string" && !value.trim())) return null;
+      const number = typeof value === "number" ? value : Number(value);
+      return Number.isFinite(number) && number >= 0 ? number : null;
+    }
+
+    function formatDuration(seconds) {
+      const totalSeconds = Math.floor(seconds);
+      if (totalSeconds < 60) return `${totalSeconds}초`;
+      const minutes = Math.floor(totalSeconds / 60);
+      const remainingSeconds = totalSeconds % 60;
+      if (minutes < 60) return remainingSeconds ? `${minutes}분 ${remainingSeconds}초` : `${minutes}분`;
+      const hours = Math.floor(minutes / 60);
+      const remainingMinutes = minutes % 60;
+      return remainingMinutes ? `${hours}시간 ${remainingMinutes}분` : `${hours}시간`;
+    }
+
+    function updateRuntime(value) {
+      const runtime = objectValue(value);
+      const version = textValue(runtime && runtime.version);
+      const cli = textValue(runtime && runtime.cli);
+      const model = textValue(runtime && runtime.model);
+      const reasoningEffort = textValue(runtime && runtime.reasoning_effort);
+      const packageRoot = textValue(runtime && runtime.package_root);
+      const hasRuntime = Boolean(version || cli || model || reasoningEffort || packageRoot);
+
+      if (runtimePanel) runtimePanel.hidden = !hasRuntime;
+      if (runtimeVersion) runtimeVersion.textContent = version || "-";
+      if (runtimeCli) runtimeCli.textContent = cli || "-";
+      if (runtimeModel) runtimeModel.textContent = model || "-";
+      if (runtimeReasoningEffort) runtimeReasoningEffort.textContent = reasoningEffort || "-";
+      if (runtimePackageRoot) runtimePackageRoot.textContent = packageRoot ? `패키지 위치: ${packageRoot}` : "";
+    }
+
+    function progressDetails(value, status) {
+      const progress = objectValue(value);
+      if (!progress) return null;
+
+      const label = textValue(progress.label);
+      const detail = textValue(progress.detail);
+      const slideCurrent = numberValue(progress.current);
+      const slideTotal = numberValue(progress.total);
+      const elapsedSeconds = numberValue(progress.elapsed_seconds);
+      const idleSeconds = numberValue(progress.idle_seconds);
+      const hasProgress = Boolean(
+        textValue(progress.phase)
+        || label
+        || detail
+        || slideCurrent !== null
+        || slideTotal !== null
+        || elapsedSeconds !== null
+        || idleSeconds !== null
+        || textValue(progress.last_activity_at),
+      );
+      if (!hasProgress) return null;
+      const summary = [];
+      const metrics = [];
+
+      if (label) summary.push(label);
+      if (detail && detail !== label) summary.push(detail);
+      if (slideCurrent !== null && slideTotal !== null) {
+        metrics.push(`슬라이드 ${Math.floor(slideCurrent)}/${Math.floor(slideTotal)}`);
+      }
+      if (elapsedSeconds !== null) metrics.push(`경과 ${formatDuration(elapsedSeconds)}`);
+      if (idleSeconds !== null) {
+        const idleDuration = formatDuration(idleSeconds);
+        const idleText = status === "running" && idleSeconds >= 30
+          ? `응답 대기 중 · 마지막 활동 ${idleDuration} 전`
+          : `마지막 활동 ${idleDuration} 전`;
+        metrics.push(idleText);
+      }
+
+      summary.push(...metrics);
+      const determinate = slideCurrent !== null && slideTotal !== null && slideTotal > 0;
+      const percentage = determinate ? Math.max(0, Math.min(100, (slideCurrent / slideTotal) * 100)) : null;
+      return {
+        determinate,
+        percentage,
+        slideCurrent,
+        slideTotal,
+        progressText: metrics.join(" · ") || [label, detail].filter(Boolean).join(" · ") || "진행 정보를 기다리고 있습니다.",
+        statusText: summary.join(" · "),
+      };
+    }
+
+    function updateProgress(value, status) {
+      if (status === "failed" || status === "cancelled" || status === "missing") {
+        if (progressPanel) progressPanel.hidden = true;
+        if (progressBar) {
+          progressBar.classList.remove("is-indeterminate");
+          progressBar.removeAttribute("aria-valuemin");
+          progressBar.removeAttribute("aria-valuemax");
+          progressBar.removeAttribute("aria-valuenow");
+        }
+        if (progressBarValue) progressBarValue.style.width = "";
+        return "";
+      }
+
+      const details = progressDetails(value, status);
+      if (status === "done") {
+        const completionText = details?.progressText ? `작업 완료 · ${details.progressText}` : "작업 완료";
+        if (progressPanel) progressPanel.hidden = false;
+        if (progressText) progressText.textContent = completionText;
+        if (progressBar) {
+          progressBar.classList.remove("is-indeterminate");
+          progressBar.setAttribute("aria-valuemin", "0");
+          progressBar.setAttribute("aria-valuemax", "100");
+          progressBar.setAttribute("aria-valuenow", "100");
+          progressBar.setAttribute("aria-valuetext", "작업 완료");
+        }
+        if (progressBarValue) progressBarValue.style.width = "100%";
+        return details?.statusText || "작업 완료";
+      }
+
+      if (progressPanel) progressPanel.hidden = !details;
+      if (!details) return "";
+
+      if (progressText) progressText.textContent = details.progressText;
+      if (progressBar) {
+        progressBar.classList.toggle("is-indeterminate", !details.determinate);
+        progressBar.setAttribute("aria-valuetext", details.statusText || "생성 진행 중");
+        if (details.determinate) {
+          const total = Math.max(0, Math.floor(details.slideTotal));
+          const current = Math.max(0, Math.min(total, Math.floor(details.slideCurrent)));
+          progressBar.setAttribute("aria-valuemin", "0");
+          progressBar.setAttribute("aria-valuemax", String(total));
+          progressBar.setAttribute("aria-valuenow", String(current));
+          if (progressBarValue) progressBarValue.style.width = `${details.percentage}%`;
+        } else {
+          progressBar.removeAttribute("aria-valuemin");
+          progressBar.removeAttribute("aria-valuemax");
+          progressBar.removeAttribute("aria-valuenow");
+          if (progressBarValue) progressBarValue.style.width = "";
+        }
+      }
+      return details.statusText;
+    }
+
+    function statusTimestamp(status) {
+      const parsed = Date.parse(textValue(status && status.updated_at));
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function shouldAcceptStatus(status) {
+      const incoming = objectValue(status);
+      if (!incoming) return false;
+      if (!lastStatus) return true;
+
+      const currentStatus = String(lastStatus.status || "");
+      const incomingStatus = String(incoming.status || "");
+      if (TERMINAL_STATUSES.has(currentStatus) && !TERMINAL_STATUSES.has(incomingStatus)) return false;
+
+      const currentRevision = numberValue(lastStatus.revision);
+      const incomingRevision = numberValue(incoming.revision);
+      if (currentRevision !== null && incomingRevision !== null) {
+        if (incomingRevision < currentRevision) return false;
+        if (incomingRevision > currentRevision) return true;
+      }
+
+      const currentTimestamp = statusTimestamp(lastStatus);
+      const incomingTimestamp = statusTimestamp(incoming);
+      return currentTimestamp === null || incomingTimestamp === null || incomingTimestamp >= currentTimestamp;
+    }
+
     function updateStatus(status) {
-      lastStatus = status || {};
+      if (!shouldAcceptStatus(status)) return false;
+
+      lastStatus = status;
       const current = String(lastStatus.status || "unknown");
-      updateSteps(current);
+      updateSteps(lastStatus);
 
       if (statusBadge) {
         statusBadge.className = `badge badge--${current}`;
         statusBadge.textContent = statusLabel(current);
       }
 
+      updateRuntime(lastStatus.runtime);
+      const progressStatus = updateProgress(lastStatus.progress, current);
       const reason = lastStatus.reason ? String(lastStatus.reason) : "";
       const stage = lastStatus.current_stage ? `현재 단계: ${lastStatus.current_stage}` : "";
-      if (statusDetail) statusDetail.textContent = reason || stage || "작업 상태를 확인하고 있습니다.";
+      if (statusDetail) statusDetail.textContent = progressStatus || reason || stage || "작업 상태를 확인하고 있습니다.";
 
       const terminal = TERMINAL_STATUSES.has(current);
       if (cancelButton) cancelButton.disabled = terminal;
       if (downloadButton) downloadButton.hidden = current !== "done";
       if (failurePanel) failurePanel.hidden = current !== "failed";
       if (failureReason) failureReason.textContent = reason || "로그를 확인해 실패 원인을 검토하세요.";
-      if (terminal) {
-        closeEventStream();
-        stopPolling();
-      }
+      if (terminal) stopPolling();
+      return true;
     }
 
     pauseButton?.addEventListener("click", () => {
+      flushIncomingLogs();
       paused = !paused;
-      if (paused) {
-        pauseButton.textContent = "다시 시작";
-      } else {
-        pauseButton.textContent = "일시정지";
-        flushLogs();
-      }
+      updatePauseButton();
+      if (!paused) flushLogs();
     });
 
     cancelButton?.addEventListener("click", async () => {
@@ -549,15 +863,16 @@
 
     fullLogButton?.addEventListener("click", () => {
       if (!log) return;
-      log.classList.toggle("is-expanded");
-      fullLogButton.textContent = log.classList.contains("is-expanded") ? "로그 접기" : "로그 전문 보기";
+      const expanded = log.classList.toggle("is-expanded");
+      fullLogButton.setAttribute("aria-expanded", String(expanded));
+      fullLogButton.textContent = expanded ? "로그 접기" : "로그 크게 보기";
       log.scrollTop = log.scrollHeight;
     });
 
     apiJson(`/api/jobs/${encodeURIComponent(jobId)}`)
       .then(updateStatus)
       .catch((error) => {
-        if (statusDetail) statusDetail.textContent = error.message || "작업 상태를 불러오지 못했습니다.";
+        if (!lastStatus && statusDetail) statusDetail.textContent = error.message || "작업 상태를 불러오지 못했습니다.";
       });
 
     if ("EventSource" in window) {
@@ -569,7 +884,7 @@
         const payload = parseEventPayload(event);
         if (!payload) return;
         stopPolling();
-        appendLog(payload.line || "");
+        appendLog(payload.line);
       });
       eventSource.addEventListener("status", (event) => {
         const payload = parseEventPayload(event);
@@ -581,8 +896,7 @@
         const payload = parseEventPayload(event);
         if (!payload) return;
         stopPolling();
-        updateStatus(payload);
-        closeEventStream();
+        if (updateStatus(payload) && isTerminalStatus(lastStatus)) closeEventStream();
       });
       eventSource.onerror = () => {
         if (!isTerminalStatus(lastStatus)) {
@@ -663,6 +977,7 @@
     const shutdownButton = $("#shutdown-server");
     const shutdownMessage = $("#shutdown-message");
     let hasKey = false;
+    let instanceToken = "";
 
     function renderSettings(settings) {
       const imageApi = settings.image_api || {};
@@ -677,6 +992,7 @@
     Promise.all([apiJson("/api/meta"), apiJson("/api/settings")])
       .then(([meta, settings]) => {
         if (versionLabel) versionLabel.textContent = meta.version || "dev";
+        instanceToken = typeof meta.instance_token === "string" ? meta.instance_token : "";
         renderSettings(settings);
       })
       .catch((error) => setMessage(settingsMessage, error.message || "설정을 불러오지 못했습니다.", "error"));
@@ -710,7 +1026,10 @@
       shutdownButton.disabled = true;
       setMessage(shutdownMessage, "서버 종료를 요청했습니다.");
       try {
-        await apiJson("/api/shutdown", { method: "POST" });
+        await apiJson("/api/shutdown", {
+          method: "POST",
+          headers: { "X-KCH-Instance": instanceToken },
+        });
         setMessage(shutdownMessage, "서버 종료 요청을 보냈습니다. 창을 닫아도 됩니다.", "success");
       } catch (error) {
         setMessage(shutdownMessage, error.message || "서버 종료 요청에 실패했습니다.", "error");

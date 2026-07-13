@@ -7,6 +7,7 @@ import shutil
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -15,9 +16,12 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.serving import make_server
 from werkzeug.utils import secure_filename
 
 if __package__ in {None, ""}:
@@ -38,6 +42,7 @@ PER_FILE_LIMIT_BYTES = 500 * 1024 * 1024
 TOTAL_UPLOAD_LIMIT_BYTES = 1024 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 TERMINAL_STATUSES = {"done", "failed", "cancelled"}
+SSE_INITIAL_LOG_BYTES = 256 * 1024
 ALLOWED_EXTENSIONS = DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS
 IMAGE_SOURCES = {"none", "web", "ai"}
 IMAGE_API_KEY_ENV = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
@@ -71,6 +76,10 @@ def create_app(
         REPO_ROOT=str(_REPO_ROOT),
         MAX_CONTENT_LENGTH=TOTAL_UPLOAD_LIMIT_BYTES + (16 * 1024 * 1024),
         FAKE_CLI=False,
+        SERVER_PORT=DEFAULT_PORT,
+        INSTANCE_ID=uuid.uuid4().hex,
+        SERVER_STARTED_AT=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        INSTANCE_TOKEN=uuid.uuid4().hex,
     )
     if config:
         app.config.update(config)
@@ -84,17 +93,28 @@ def create_app(
     webtool_root = Path(app.config["WEBTOOL_ROOT"]).expanduser().resolve(strict=False)
     repo_root = Path(app.config["REPO_ROOT"]).expanduser().resolve(strict=False)
     ppt_master_root = resolve_ppt_master_root(webtool_root)
+    app_version = _read_version(webtool_root, repo_root)
+    app.config["APP_VERSION"] = app_version
     settings = Settings(data_dir)
     history = History(data_dir)
-    runner_holder: dict[str, JobRunner] = {}
+    current_runner = JobRunner(workspace_root, data_dir)
 
     def runner() -> JobRunner:
-        current = runner_holder.get("runner")
-        if current is None:
-            current = JobRunner(workspace_root, data_dir)
-            runner_holder["runner"] = current
-        return current
+        return current_runner
 
+    cli_cache: dict[str, Any] = {"expires_at": 0.0, "value": None}
+    cli_cache_lock = threading.Lock()
+
+    def detected_clis() -> dict[str, Any]:
+        now = time.monotonic()
+        with cli_cache_lock:
+            cached = cli_cache.get("value")
+            if isinstance(cached, dict) and now < float(cli_cache.get("expires_at") or 0):
+                return cached
+            detected = _detect_all_for_app(app, webtool_root)
+            cli_cache["value"] = detected
+            cli_cache["expires_at"] = now + 30
+            return detected
     app.extensions["ppt_webtool"] = {
         "data_dir": data_dir,
         "workspace_root": workspace_root,
@@ -105,6 +125,7 @@ def create_app(
 
     def page_context(**extra: Any) -> dict[str, Any]:
         context: dict[str, Any] = {
+            "app_version": app_version,
             "allowed_extensions": ", ".join(sorted(ALLOWED_EXTENSIONS)),
             "allowed_accept": ",".join(sorted(ALLOWED_EXTENSIONS)),
             "per_file_limit_mb": PER_FILE_LIMIT_BYTES // (1024 * 1024),
@@ -137,16 +158,35 @@ def create_app(
     def handle_request_too_large(_error: RequestEntityTooLarge) -> tuple[Response, int]:
         return _json_error("업로드 합계가 1GB 제한을 초과했습니다.", 400)
 
+    @app.get("/api/identity")
+    def api_identity() -> Response:
+        return jsonify(
+            {
+                "app_id": "kch-ppt-tool",
+                "instance_id": app.config["INSTANCE_ID"],
+                "instance_root": str(webtool_root),
+                "server_port": int(app.config["SERVER_PORT"]),
+                "started_at": app.config["SERVER_STARTED_AT"],
+                "version": app_version,
+            }
+        )
+
     @app.get("/api/meta")
     def api_meta() -> Response:
         settings_data = settings.load()
         public_settings = _public_settings(settings_data)
         return jsonify(
             {
-                "version": _read_version(webtool_root, repo_root),
-                "clis": _serialize_clis(_detect_all_for_app(app, webtool_root)),
+                "app_id": "kch-ppt-tool",
+                "instance_id": app.config["INSTANCE_ID"],
+                "instance_root": str(webtool_root),
+                "server_port": int(app.config["SERVER_PORT"]),
+                "started_at": app.config["SERVER_STARTED_AT"],
+                "version": app_version,
+                "clis": _serialize_clis(detected_clis()),
                 "notice_accepted": bool(settings_data.get("security_notice_accepted")),
                 "image_api": public_settings["image_api"],
+                "instance_token": app.config["INSTANCE_TOKEN"],
             }
         )
 
@@ -204,15 +244,21 @@ def create_app(
             incoming_dir.mkdir()
             saved_uploads = _save_uploads(uploads, incoming_dir)
             project_dir = workspace / "project"
+            settings_data = settings.load()
             pipeline_ctx: dict[str, Any] = {
                 "job_id": job_id,
                 "workspace": str(workspace),
                 "raw_dir": str(workspace / "_raw"),
                 "project_dir": str(project_dir),
                 "manifest": None,
-                "image_env": _image_env(settings.load()),
-                "cli_model": settings.load().get("claude_model"),
-                "job_timeout_seconds": int(settings.load().get("job_timeout_minutes", 60)) * 60,
+                "image_env": _image_env(settings_data),
+                "cli_model": settings_data.get("claude_model"),
+                "job_timeout_seconds": int(settings_data.get("job_timeout_minutes", 60)) * 60,
+            }
+            pipeline_ctx["runtime"] = {
+                "version": app_version,
+                "package_root": str(webtool_root),
+                **_adapter_runtime_info(adapter, pipeline_ctx),
             }
 
             def run_preprocess() -> dict[str, Any]:
@@ -286,6 +332,13 @@ def create_app(
         _append_history_if_terminal(history, status)
         return jsonify(status)
 
+    @app.get("/api/jobs/<job_id>/log")
+    def api_job_log(job_id: str) -> Response | tuple[Response, int]:
+        path = runner().get_log_path(job_id)
+        if path is None or not path.is_file():
+            return _json_error("원본 작업 로그를 찾을 수 없습니다.", 404)
+        return send_file(path, mimetype="text/plain", as_attachment=False)
+
     @app.get("/api/jobs/<job_id>/download")
     def api_download_job(job_id: str) -> Response | tuple[Response, int]:
         status = runner().get_status(job_id)
@@ -302,7 +355,11 @@ def create_app(
     def api_shutdown() -> Response | tuple[Response, int]:
         if request.remote_addr not in {"127.0.0.1", "::1", "localhost"}:
             return _json_error("localhost 요청만 종료할 수 있습니다.", 403)
-        shutdown = request.environ.get("werkzeug.server.shutdown")
+        if request.headers.get("X-KCH-Instance") != app.config["INSTANCE_TOKEN"]:
+            return _json_error("유효한 로컬 인스턴스 토큰이 필요합니다.", 403)
+        if runner().is_busy():
+            return _json_error("작업이 실행 중이므로 서버를 종료할 수 없습니다. 작업을 먼저 취소하십시오.", 409)
+        shutdown = app.extensions["ppt_webtool"].get("shutdown_server") or request.environ.get("werkzeug.server.shutdown")
         if callable(shutdown):
             threading.Thread(target=shutdown, daemon=True).start()
         else:
@@ -466,6 +523,18 @@ def _validate_image_source(image_source: str) -> None:
         raise ValidationError(f"image_source는 다음 중 하나여야 합니다: {allowed}")
 
 
+def _adapter_runtime_info(adapter: Any, job_ctx: dict[str, Any]) -> dict[str, Any]:
+    describe = getattr(adapter, "runtime_info", None)
+    if callable(describe):
+        result = describe(job_ctx)
+        if isinstance(result, dict):
+            return result
+    return {
+        "cli": str(getattr(adapter, "name", "") or ""),
+        "model": None,
+        "reasoning_effort": None,
+    }
+
 def _available_adapter(
     cli_name: str,
     *,
@@ -596,8 +665,13 @@ def _image_env(settings_data: dict[str, Any]) -> dict[str, str]:
 
 
 def _event_stream(runner: JobRunner, history: History, job_id: str) -> Any:
-    offset = 0
-    last_status: str | None = None
+    offset = runner.initial_log_offset(job_id, SSE_INITIAL_LOG_BYTES)
+    if offset:
+        yield _sse(
+            "log",
+            {"line": "[INFO] 이전 로그는 화면 전송에서 생략했습니다. '원본 로그 열기'에서 전체 내용을 확인할 수 있습니다."},
+        )
+    last_marker: tuple[str, str] | None = None
     while True:
         offset, lines = runner.iter_log(job_id, offset)
         for line in lines:
@@ -605,9 +679,10 @@ def _event_stream(runner: JobRunner, history: History, job_id: str) -> Any:
 
         status = runner.get_status(job_id)
         current_status = str(status.get("status") or "unknown")
-        if current_status != last_status:
+        marker = (current_status, str(status.get("updated_at") or ""))
+        if marker != last_marker:
             yield _sse("status", status)
-            last_status = current_status
+            last_marker = marker
 
         if current_status in TERMINAL_STATUSES or current_status == "missing":
             offset, lines = runner.iter_log(job_id, offset)
@@ -680,11 +755,196 @@ def _new_job_id() -> str:
     return f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
 
 
+class ServerInstanceLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.identity_path = path.with_suffix(".json")
+        self._handle: Any = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        self._handle = handle
+        return True
+
+    def write_identity(self, identity: dict[str, Any]) -> None:
+        if self._handle is None:
+            raise RuntimeError("인스턴스 잠금을 먼저 획득해야 합니다.")
+        payload = json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        temporary = self.identity_path.with_name(f".{self.identity_path.name}.{os.getpid()}.tmp")
+        try:
+            with temporary.open("wb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.identity_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def read_identity(self) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(self.identity_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            self._handle = None
+
+
+def _instance_lock_path() -> Path:
+    root = os.environ.get("LOCALAPPDATA")
+    base = Path(root) if root else Path(tempfile.gettempdir())
+    return base / "KCH-PPT-Tool" / "server.lock"
+
+
+def _locked_instance_identity(lock: ServerInstanceLock, wait_seconds: float = 3.0) -> dict[str, Any] | None:
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        identity = lock.read_identity()
+        if identity:
+            return identity
+        time.sleep(0.1)
+    return lock.read_identity()
+
+def _probe_existing_instance(
+    host: str = HOST,
+    port: int = DEFAULT_PORT,
+    timeout_seconds: float = 4.0,
+) -> dict[str, Any] | None:
+    base_url = f"http://{host}:{port}"
+    for endpoint in ("/api/identity", "/api/meta"):
+        try:
+            with urllib_request.urlopen(base_url + endpoint, timeout=timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, TimeoutError, ValueError, urllib_error.URLError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        is_current = payload.get("app_id") == "kch-ppt-tool"
+        is_legacy = endpoint == "/api/meta" and bool(
+            payload.get("version") and isinstance(payload.get("clis"), dict)
+        )
+        if not (is_current or is_legacy):
+            continue
+        payload["_url"] = base_url
+        return payload
+    return None
+
+
+def _port_has_listener(host: str, port: int, timeout_seconds: float = 0.05) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(timeout_seconds)
+        try:
+            return probe.connect_ex((host, port)) == 0
+        except OSError:
+            return False
+
+
+def _probe_existing_release(
+    host: str = HOST,
+    start_port: int = DEFAULT_PORT,
+    max_increment: int = PORT_SEARCH_LIMIT,
+) -> dict[str, Any] | None:
+    for port in range(start_port, start_port + max_increment + 1):
+        if not _port_has_listener(host, port):
+            continue
+        identity = _probe_existing_instance(host=host, port=port, timeout_seconds=0.4)
+        if identity is not None:
+            return identity
+    return None
+
+
+def _existing_instance_action(
+    existing: dict[str, Any] | None,
+    *,
+    current_version: str,
+    current_root: Path,
+) -> tuple[str, str] | None:
+    if not existing:
+        return None
+    existing_url = str(existing.get("_url") or f"http://{HOST}:{DEFAULT_PORT}")
+    existing_version = str(existing.get("version") or "알 수 없음")
+    existing_root = existing.get("instance_root")
+    same_root = not existing_root or Path(str(existing_root)).resolve(strict=False) == current_root.resolve(strict=False)
+    if existing_version == current_version and same_root:
+        return ("reuse", existing_url)
+    return ("conflict", existing_url)
+
+
+def _report_existing_instance(
+    existing: dict[str, Any] | None,
+    *,
+    current_version: str,
+    current_root: Path,
+    no_browser: bool,
+) -> int | None:
+    action = _existing_instance_action(
+        existing,
+        current_version=current_version,
+        current_root=current_root,
+    )
+    if action is None:
+        return None
+    mode, existing_url = action
+    if mode == "reuse":
+        print(
+            f"[INFO] KCH-PPT-Tool {current_version} 서버가 이미 실행 중입니다: {existing_url}",
+            flush=True,
+        )
+        if not no_browser:
+            webbrowser.open(existing_url)
+        return 0
+
+    existing_version = str((existing or {}).get("version") or "알 수 없음")
+    existing_root = str((existing or {}).get("instance_root") or "이전 배포본")
+    print(
+        "[ERROR] 다른 KCH-PPT-Tool 서버가 이미 실행 중입니다.\n"
+        f"        실행 중: version={existing_version}, path={existing_root}, url={existing_url}\n"
+        f"        시작 요청: version={current_version}, path={current_root}\n"
+        "        기존 서버의 설정 화면에서 '서버 종료'를 누르거나 기존 콘솔을 닫은 뒤 다시 실행하십시오.",
+        flush=True,
+    )
+    if not no_browser:
+        webbrowser.open(existing_url)
+    return 2
+
 def _find_available_port(host: str = HOST, start_port: int = DEFAULT_PORT, max_increment: int = PORT_SEARCH_LIMIT) -> int:
     last_error: OSError | None = None
     for port in range(start_port, start_port + max_increment + 1):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((host, port))
             except OSError as exc:
@@ -694,7 +954,7 @@ def _find_available_port(host: str = HOST, start_port: int = DEFAULT_PORT, max_i
     raise OSError(f"사용 가능한 포트를 찾지 못했습니다: {start_port}-{start_port + max_increment}") from last_error
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ppt-webtool Flask server")
     parser.add_argument("--no-browser", action="store_true", help="서버 시작 후 브라우저를 열지 않습니다.")
     parser.add_argument(
@@ -704,15 +964,68 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    port = _find_available_port()
-    url = f"http://{HOST}:{port}"
-    # Development/e2e only: this does not expose a fake option in the UI; selected CLI names use tests/fake_cli.py.
-    app = create_app(config={"FAKE_CLI": args.fake_cli})
-    print(f"ppt-webtool server listening on {url}", flush=True)
-    if not args.no_browser:
-        webbrowser.open(url)
-    app.run(host=HOST, port=port, threaded=True, use_reloader=False)
+    current_version = _read_version(_WEBTOOL_ROOT, _REPO_ROOT)
+    instance_lock = ServerInstanceLock(_instance_lock_path())
+    if not instance_lock.acquire():
+        existing = _locked_instance_identity(instance_lock)
+        result = _report_existing_instance(
+            existing,
+            current_version=current_version,
+            current_root=_WEBTOOL_ROOT,
+            no_browser=args.no_browser,
+        )
+        if result is not None:
+            return result
+        print(
+            "[ERROR] KCH-PPT-Tool 서버가 시작 중이거나 잠금 정보를 읽을 수 없습니다. 잠시 후 다시 실행하십시오.",
+            flush=True,
+        )
+        return 2
+
+    try:
+        legacy = _probe_existing_release()
+        result = _report_existing_instance(
+            legacy,
+            current_version=current_version,
+            current_root=_WEBTOOL_ROOT,
+            no_browser=args.no_browser,
+        )
+        if result is not None:
+            return result
+
+        port = _find_available_port()
+        url = f"http://{HOST}:{port}"
+        if port != DEFAULT_PORT:
+            print(
+                f"[WARN] 기본 포트 {DEFAULT_PORT}가 다른 프로그램에서 사용 중이므로 {port} 포트를 사용합니다.",
+                flush=True,
+            )
+
+        # Development/e2e only: this does not expose a fake option in the UI.
+        app = create_app(config={"FAKE_CLI": args.fake_cli, "SERVER_PORT": port})
+        server = make_server(HOST, port, app, threaded=True)
+        app.extensions["ppt_webtool"]["shutdown_server"] = server.shutdown
+        instance_lock.write_identity(
+            {
+                "app_id": "kch-ppt-tool",
+                "version": current_version,
+                "instance_root": str(_WEBTOOL_ROOT),
+                "server_port": port,
+                "_url": url,
+                "pid": os.getpid(),
+            }
+        )
+        print(f"ppt-webtool server listening on {url}", flush=True)
+        if not args.no_browser:
+            webbrowser.open(url)
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+        return 0
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

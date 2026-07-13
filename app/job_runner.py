@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -27,8 +28,11 @@ except ImportError:  # Direct module import in small smoke checks.
 WARN_IDLE_SECONDS = 180
 STALL_IDLE_SECONDS = 720
 DEFAULT_TIMEOUT_SECONDS = 3600
+HEARTBEAT_INTERVAL_SECONDS = 10
+LOG_READ_CHUNK_BYTES = 64 * 1024
 TERMINAL_STATUSES = {"done", "failed", "cancelled"}
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_PAGE_COUNT_RE = re.compile(r"\|\s*\*\*Page Count\*\*\s*\|\s*(\d+)\s*\|", re.IGNORECASE)
 
 
 class BusyError(RuntimeError):
@@ -48,7 +52,7 @@ class _JobState:
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     lock: threading.RLock = field(default_factory=threading.RLock)
     log_lock: threading.Lock = field(default_factory=threading.Lock)
-    persist_lock: threading.Lock = field(default_factory=threading.Lock)
+    persist_lock: threading.RLock = field(default_factory=threading.RLock)
     process: subprocess.Popen[str] | None = None
     active_processes: list[subprocess.Popen[str]] = field(default_factory=list)
     cancel_event: threading.Event = field(default_factory=threading.Event)
@@ -101,11 +105,14 @@ class JobRunner:
                 "log_path": str(log_path),
                 "created_at": now,
                 "updated_at": now,
+                "revision": 0,
                 "current_stage": None,
                 "stage_index": None,
                 "stages_total": len(stage_list),
                 "reason": None,
                 "result_files": [],
+                "runtime": _runtime_info(None),
+                "progress": _initial_progress(now),
                 "events": [],
             }
             job = _JobState(
@@ -167,6 +174,7 @@ class JobRunner:
 
             now = _utc_now()
             log_path = workspace / "job.log"
+            runtime = _runtime_info(job_ctx)
             record: dict[str, Any] = {
                 "job_id": selected_job_id,
                 "id": selected_job_id,
@@ -177,11 +185,14 @@ class JobRunner:
                 "log_path": str(log_path),
                 "created_at": now,
                 "updated_at": now,
+                "revision": 0,
                 "current_stage": None,
                 "stage_index": None,
                 "stages_total": 0,
                 "reason": None,
                 "result_files": [],
+                "runtime": runtime,
+                "progress": _initial_progress(now),
                 "events": [],
             }
             job = _JobState(
@@ -243,12 +254,27 @@ class JobRunner:
         job = self._get_job(job_id)
         if job is not None:
             with job.lock:
-                return dict(job.record)
+                return _normalize_status(copy.deepcopy(job.record))
 
         record = self._load_record(job_id)
         if record is not None:
-            return record
+            return _normalize_status(copy.deepcopy(record))
         return self._missing_status(job_id)
+
+    def get_log_path(self, job_id: str) -> Path | None:
+        return self._log_path_for(job_id)
+
+    def initial_log_offset(self, job_id: str, max_bytes: int) -> int:
+        log_path = self._log_path_for(job_id)
+        if log_path is None or not log_path.exists():
+            return 0
+        start = max(0, log_path.stat().st_size - max(0, max_bytes))
+        if not start:
+            return 0
+        with log_path.open("rb") as handle:
+            handle.seek(start)
+            handle.readline()
+            return handle.tell()
 
     def iter_log(self, job_id: str, offset: int) -> tuple[int, list[str]]:
         log_path = self._log_path_for(job_id)
@@ -261,7 +287,9 @@ class JobRunner:
             safe_offset = 0
         with log_path.open("rb") as handle:
             handle.seek(safe_offset)
-            data = handle.read()
+            data = handle.read(LOG_READ_CHUNK_BYTES)
+            if data and not data.endswith(b"\n"):
+                data += handle.readline()
             new_offset = handle.tell()
         if not data:
             return new_offset, []
@@ -293,6 +321,12 @@ class JobRunner:
 
             self._set_status(job, "preprocessing", current_stage="preprocess", stage_index=None)
             self._record_event(job, "PREPROCESS_START")
+            self._set_progress(
+                job,
+                phase="preprocessing",
+                label="입력 자료 전처리 중",
+                detail="업로드 자료를 읽고 발표자료 생성용 텍스트로 변환하고 있습니다.",
+            )
             preprocess_done, manifest, preprocess_exc = self._run_preprocess_with_deadline(job, preprocess_fn, job_start)
             if not preprocess_done:
                 return
@@ -328,6 +362,12 @@ class JobRunner:
             uploads = manifest.get("uploads")
             upload_count = len(uploads) if isinstance(uploads, list) else 0
             self._record_event(job, "PREPROCESS_DONE", {"uploads": upload_count})
+            self._set_progress(
+                job,
+                phase="preprocessing_done",
+                label="자료 전처리 완료",
+                detail=f"입력 자료 {upload_count}개를 변환했습니다. AI 생성 단계를 준비하고 있습니다.",
+            )
             if self._fail_if_job_timeout(job, job_start):
                 return
 
@@ -376,13 +416,27 @@ class JobRunner:
         preprocess_thread.start()
 
         deadline = job_start + job.timeout_seconds
+        next_heartbeat = time.monotonic()
         while preprocess_thread.is_alive():
             if self._is_cancelled(job):
                 self._terminate_active_processes(job, "cancelled")
                 self._set_terminal(job, "cancelled", "사용자가 작업을 취소했습니다")
                 return False, None, None
 
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            if now >= next_heartbeat:
+                self._set_progress(
+                    job,
+                    phase="preprocessing",
+                    label="입력 자료 전처리 중",
+                    detail="업로드 자료를 읽고 발표자료 생성용 텍스트로 변환하고 있습니다.",
+                    elapsed_seconds=round(now - job_start),
+                    idle_seconds=0,
+                    last_activity_at=_utc_now(),
+                )
+                next_heartbeat = now + HEARTBEAT_INTERVAL_SECONDS
+
+            remaining = deadline - now
             if remaining <= 0:
                 reason = f"작업 전체 제한 시간({job.timeout_seconds}초)을 초과했습니다"
                 self._record_event(
@@ -423,6 +477,12 @@ class JobRunner:
 
             status = "preprocessing" if stage.kind == "preprocess" else "running"
             self._set_status(job, status, current_stage=stage.id, stage_index=index)
+            self._set_progress(
+                job,
+                phase="generating",
+                label="AI가 발표자료를 설계 중",
+                detail=f"{stage.id} 스테이지를 실행하고 있습니다.",
+            )
             ok, terminal_status, reason = self._run_stage(job, stage, job_start)
             if terminal_status == "cancelled":
                 self._set_terminal(job, "cancelled", reason or "사용자가 작업을 취소했습니다")
@@ -436,6 +496,12 @@ class JobRunner:
                 self._set_terminal(job, "failed", manifest_error)
                 return
 
+            self._set_progress(
+                job,
+                phase="validating",
+                label="결과물 검증 중",
+                detail="생성된 파일과 PPTX 구조를 검사하고 있습니다.",
+            )
             ok, reason = self._run_validators(job, stage)
             if not ok:
                 self._set_terminal(job, "failed", reason or "스테이지 검증에 실패했습니다")
@@ -511,10 +577,17 @@ class JobRunner:
         env.update({key: str(value) for key, value in stage.env.items()})
         env["PYTHONUTF8"] = "1"
         stage_timeout = stage.timeout_seconds if stage.timeout_seconds > 0 else DEFAULT_TIMEOUT_SECONDS
+        initial_artifacts = _artifact_progress(job.project_dir)
+        initial_activity_time = time.monotonic()
+        state_now = _utc_now()
         state: dict[str, Any] = {
-            "last_output_time": time.monotonic(),
+            "last_output_time": initial_activity_time,
             "idle_warned": False,
             "transient_error": False,
+            "last_output_at": state_now,
+            "last_artifact_time": initial_activity_time,
+            "last_artifact_at": state_now,
+            "artifact_token": initial_artifacts["activity_token"],
         }
         state_lock = threading.Lock()
 
@@ -557,6 +630,7 @@ class JobRunner:
 
         stage_start = time.monotonic()
         kill_reason: str | None = None
+        next_heartbeat = stage_start
         try:
             while True:
                 now = time.monotonic()
@@ -570,8 +644,44 @@ class JobRunner:
                 stage_elapsed = now - stage_start
                 job_elapsed = now - job_start
                 with state_lock:
-                    idle_seconds = now - float(state["last_output_time"])
+                    last_output_time = float(state["last_output_time"])
+                    last_artifact_time = float(state["last_artifact_time"])
+                    last_activity_time = max(last_output_time, last_artifact_time)
+                    idle_seconds = now - last_activity_time
                     idle_warned = bool(state["idle_warned"])
+                    last_activity_at = str(
+                        state["last_output_at"]
+                        if last_output_time >= last_artifact_time
+                        else state["last_artifact_at"]
+                    )
+
+                if now >= next_heartbeat:
+                    artifacts = _artifact_progress(job.project_dir)
+                    with state_lock:
+                        if artifacts["activity_token"] != state["artifact_token"]:
+                            state["artifact_token"] = artifacts["activity_token"]
+                            state["last_artifact_time"] = now
+                            state["last_artifact_at"] = _utc_now()
+                            state["idle_warned"] = False
+                        last_output_time = float(state["last_output_time"])
+                        last_artifact_time = float(state["last_artifact_time"])
+                        last_activity_time = max(last_output_time, last_artifact_time)
+                        idle_seconds = now - last_activity_time
+                        idle_warned = bool(state["idle_warned"])
+                        last_activity_at = str(
+                            state["last_output_at"]
+                            if last_output_time >= last_artifact_time
+                            else state["last_artifact_at"]
+                        )
+                    self._refresh_running_progress(
+                        job,
+                        stage,
+                        artifacts=artifacts,
+                        elapsed_seconds=job_elapsed,
+                        idle_seconds=idle_seconds,
+                        last_activity_at=last_activity_at,
+                    )
+                    next_heartbeat = now + HEARTBEAT_INTERVAL_SECONDS
 
                 if job_elapsed >= job.timeout_seconds:
                     kill_reason = "job_timeout"
@@ -673,6 +783,7 @@ class JobRunner:
                 line = raw_line.rstrip("\n")
                 with state_lock:
                     state["last_output_time"] = time.monotonic()
+                    state["last_output_at"] = _utc_now()
                     state["idle_warned"] = False
                     lowered = line.casefold()
                     if any(
@@ -735,6 +846,64 @@ class JobRunner:
     def _collect_result_files(self, job: _JobState) -> list[str]:
         return collect_result_files(job.stages, job.workspace)
 
+    def _refresh_running_progress(
+        self,
+        job: _JobState,
+        stage: Stage,
+        *,
+        artifacts: dict[str, Any],
+        elapsed_seconds: float,
+        idle_seconds: float,
+        last_activity_at: str,
+    ) -> None:
+        phase = "generating"
+        label = "AI가 입력 자료를 분석 중"
+        detail = f"{stage.id} 스테이지가 실행 중입니다."
+        current: int | None = None
+        total: int | None = artifacts["total_slides"]
+
+        if artifacts["pptx_ready"]:
+            phase = "validating"
+            label = "PPTX 결과 검증 중"
+            detail = "PPTX 파일이 생성되어 구조와 필수 산출물을 검사하고 있습니다."
+        elif artifacts["slides_finalized"]:
+            phase = "postprocessing"
+            label = "슬라이드 후처리 중"
+            current = artifacts["slides_finalized"]
+            detail = "생성된 슬라이드의 호환성과 품질을 정리하고 있습니다."
+        elif artifacts["slides_created"]:
+            phase = "slides"
+            label = "슬라이드 생성 중"
+            current = artifacts["slides_created"]
+            detail = "SVG 슬라이드를 순차적으로 작성하고 있습니다."
+        elif artifacts["design_ready"]:
+            image_total = artifacts["ai_images_total"]
+            image_ready = artifacts["ai_images_ready"]
+            if image_total and image_ready < image_total:
+                phase = "images"
+                label = "AI 이미지 생성 중"
+                detail = f"슬라이드에 사용할 AI 이미지를 생성하고 있습니다 ({image_ready}/{image_total})."
+            else:
+                phase = "slides"
+                label = "슬라이드 생성 준비 중"
+                detail = "디자인 설계를 마치고 슬라이드를 순차적으로 작성할 준비를 하고 있습니다."
+        elif artifacts["project_ready"]:
+            phase = "design"
+            label = "자료 분석 및 디자인 설계 중"
+            detail = "내용 구조, 시각 체계, 슬라이드 구성을 설계하고 있습니다."
+
+        self._set_progress(
+            job,
+            phase=phase,
+            label=label,
+            detail=detail,
+            current=current,
+            total=total,
+            elapsed_seconds=round(elapsed_seconds),
+            idle_seconds=round(idle_seconds),
+            last_activity_at=last_activity_at,
+        )
+
     def _refresh_manifest(self, job: _JobState) -> str | None:
         if not (job.workspace / "manifest.json").exists():
             return None
@@ -783,21 +952,80 @@ class JobRunner:
         self._persist_job(job)
         self._record_event(job, "STATUS", {"status": status, "current_stage": current_stage})
 
+    def _set_progress(
+        self,
+        job: _JobState,
+        *,
+        phase: str,
+        label: str,
+        detail: str,
+        current: int | None = None,
+        total: int | None = None,
+        elapsed_seconds: int | None = None,
+        idle_seconds: int | None = None,
+        last_activity_at: str | None = None,
+    ) -> None:
+        now = _utc_now()
+        with job.lock:
+            previous = job.record.get("progress")
+            previous_progress = previous if isinstance(previous, dict) else {}
+            job.record["progress"] = {
+                "phase": phase,
+                "label": label,
+                "detail": detail,
+                "current": current,
+                "total": total,
+                "elapsed_seconds": (
+                    elapsed_seconds
+                    if elapsed_seconds is not None
+                    else int(previous_progress.get("elapsed_seconds") or 0)
+                ),
+                "idle_seconds": idle_seconds if idle_seconds is not None else 0,
+                "last_activity_at": last_activity_at or now,
+                "updated_at": now,
+            }
+            job.record["updated_at"] = now
+        self._persist_job(job)
+
     def _set_terminal(self, job: _JobState, status: str, reason: str | None) -> None:
+        now = _utc_now()
+        terminal_label = {
+            "done": "발표자료 생성 완료",
+            "failed": "작업 실패",
+            "cancelled": "작업 취소",
+        }.get(status, status)
+        details: dict[str, Any] = {"status": status}
+        if reason:
+            details["reason"] = reason
+        item: dict[str, Any] = {"ts": now, "event": "TERMINAL", **details}
+
         with job.lock:
             existing = job.record["status"]
-            if existing in TERMINAL_STATUSES and existing != status:
+            if existing in TERMINAL_STATUSES:
                 return
+            previous = job.record.get("progress")
+            previous_progress = previous if isinstance(previous, dict) else {}
             job.record["status"] = status
             job.record["current_stage"] = None
             job.record["stage_index"] = None
             job.record["reason"] = reason
-            job.record["updated_at"] = _utc_now()
+            job.record["progress"] = {
+                "phase": status,
+                "label": terminal_label,
+                "detail": reason or "모든 생성 및 검증 단계를 완료했습니다.",
+                "current": previous_progress.get("current"),
+                "total": previous_progress.get("total"),
+                "elapsed_seconds": int(previous_progress.get("elapsed_seconds") or 0),
+                "idle_seconds": 0,
+                "last_activity_at": now,
+                "updated_at": now,
+            }
+            job.record["events"].append(item)
+            job.record["updated_at"] = now
+            suffix = f" {json.dumps(details, ensure_ascii=False, sort_keys=True)}"
+            self._write_log(job, f"[EVENT] TERMINAL{suffix}")
+
         self._persist_job(job)
-        details: dict[str, Any] = {"status": status}
-        if reason:
-            details["reason"] = reason
-        self._record_event(job, "TERMINAL", details)
 
     def _record_event(self, job: _JobState, event: str, details: dict[str, Any] | None = None) -> None:
         item: dict[str, Any] = {"ts": _utc_now(), "event": event}
@@ -818,9 +1046,11 @@ class JobRunner:
                 handle.write(line)
 
     def _persist_job(self, job: _JobState) -> None:
-        with job.lock:
-            payload = dict(job.record)
-        self._store.persist(job.id, payload, job.persist_lock)
+        with job.persist_lock:
+            with job.lock:
+                job.record["revision"] = int(job.record.get("revision") or 0) + 1
+                payload = copy.deepcopy(job.record)
+            self._store.persist(job.id, payload, job.persist_lock)
 
     def _is_cancelled(self, job: _JobState) -> bool:
         with job.lock:
@@ -840,12 +1070,14 @@ class JobRunner:
         record = self._load_record(job_id)
         if record is not None and record.get("log_path"):
             return Path(str(record["log_path"]))
-        if not _JOB_ID_RE.fullmatch(job_id):
+        if job_id in {".", ".."} or not _JOB_ID_RE.fullmatch(job_id):
             return None
         return self.workspace_root / job_id / "job.log"
 
     def _missing_status(self, job_id: str) -> dict[str, Any]:
-        return {"job_id": job_id, "id": job_id, "status": "missing", "reason": "작업을 찾을 수 없습니다"}
+        return _normalize_status(
+            {"job_id": job_id, "id": job_id, "status": "missing", "reason": "작업을 찾을 수 없습니다"}
+        )
 
     def _infer_job_id(self, stages: list[Stage]) -> str | None:
         root = self.workspace_root.resolve(strict=False)
@@ -866,15 +1098,148 @@ class JobRunner:
         return f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
 
     def _validate_job_id(self, job_id: str) -> None:
-        if not _JOB_ID_RE.fullmatch(job_id):
+        if job_id in {".", ".."} or not _JOB_ID_RE.fullmatch(job_id):
             raise ValueError(f"유효하지 않은 job_id입니다: {job_id!r}")
 
 
+def _initial_progress(now: str) -> dict[str, Any]:
+    return {
+        "phase": "queued",
+        "label": "작업 접수됨",
+        "detail": "입력 자료 전처리를 기다리고 있습니다.",
+        "current": None,
+        "total": None,
+        "elapsed_seconds": 0,
+        "idle_seconds": 0,
+        "last_activity_at": now,
+        "updated_at": now,
+    }
+
+
+def _runtime_info(job_ctx: dict[str, Any] | None) -> dict[str, Any]:
+    result = {
+        "version": None,
+        "cli": None,
+        "model": None,
+        "reasoning_effort": None,
+        "package_root": None,
+    }
+    if not isinstance(job_ctx, dict):
+        return result
+    raw = job_ctx.get("runtime")
+    if isinstance(raw, dict):
+        result.update({key: raw.get(key) for key in result})
+    return result
+
+
+def _normalize_status(record: dict[str, Any]) -> dict[str, Any]:
+    runtime = record.get("runtime")
+    record["runtime"] = _runtime_info({"runtime": runtime}) if isinstance(runtime, dict) else _runtime_info(None)
+    try:
+        record["revision"] = max(0, int(record.get("revision") or 0))
+    except (TypeError, ValueError):
+        record["revision"] = 0
+    if not isinstance(record.get("progress"), dict):
+        timestamp = str(record.get("updated_at") or record.get("created_at") or _utc_now())
+        status = str(record.get("status") or "queued")
+        labels = {
+            "queued": "작업 접수됨",
+            "preprocessing": "입력 자료 전처리 중",
+            "running": "기존 작업 상태 확인 중",
+            "done": "발표자료 생성 완료",
+            "failed": "작업 실패",
+            "cancelled": "작업 취소",
+            "missing": "작업을 찾을 수 없음",
+        }
+        progress = _initial_progress(timestamp)
+        progress.update(
+            {
+                "phase": status,
+                "label": labels.get(status, status),
+                "detail": str(record.get("reason") or "저장된 작업 상태를 불러왔습니다."),
+            }
+        )
+        record["progress"] = progress
+    return record
+
+
+def _artifact_progress(project_dir: Path) -> dict[str, Any]:
+    deck_roots = [path for path in project_dir.glob("projects/*") if path.is_dir()]
+    design_ready = False
+    total_slides: int | None = None
+    ai_images_total = 0
+    ai_images_ready = 0
+    created_names: set[str] = set()
+    finalized_names: set[str] = set()
+    pptx_ready = False
+    activity_parts: list[tuple[str, int, int]] = []
+
+    def note_activity(path: Path) -> None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        activity_parts.append((str(path), stat.st_mtime_ns, stat.st_size))
+
+    for deck_root in deck_roots:
+        note_activity(deck_root)
+        design_spec = deck_root / "design_spec.md"
+        if design_spec.is_file():
+            design_ready = True
+            note_activity(design_spec)
+            if total_slides is None:
+                try:
+                    match = _PAGE_COUNT_RE.search(design_spec.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    match = None
+                if match:
+                    total_slides = int(match.group(1))
+
+        prompts_path = deck_root / "images" / "image_prompts.json"
+        if prompts_path.is_file():
+            note_activity(prompts_path)
+            try:
+                prompt_data = json.loads(prompts_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                prompt_data = {}
+            items = prompt_data.get("items") if isinstance(prompt_data, dict) else None
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    filename = item.get("filename")
+                    if not isinstance(filename, str) or not filename.strip():
+                        continue
+                    ai_images_total += 1
+                    image_path = deck_root / "images" / filename
+                    if image_path.is_file():
+                        ai_images_ready += 1
+                        note_activity(image_path)
+
+        for path in (deck_root / "svg_output").glob("*.svg"):
+            created_names.add(path.name)
+            note_activity(path)
+        for path in (deck_root / "svg_final").glob("*.svg"):
+            finalized_names.add(path.name)
+            note_activity(path)
+        for path in (deck_root / "exports").glob("*.pptx"):
+            pptx_ready = True
+            note_activity(path)
+
+    return {
+        "project_ready": bool(deck_roots),
+        "design_ready": design_ready,
+        "total_slides": total_slides,
+        "ai_images_total": ai_images_total,
+        "ai_images_ready": ai_images_ready,
+        "slides_created": len(created_names | finalized_names),
+        "slides_finalized": len(finalized_names),
+        "pptx_ready": pptx_ready,
+        "activity_token": repr(sorted(activity_parts)),
+    }
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-
 
 def _display_command(command: Any) -> Any:
     if isinstance(command, (list, tuple)):

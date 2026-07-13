@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
-from ..paths import process_group_popen_kwargs, resolve_launch_command
+from ..paths import process_group_popen_kwargs, resolve_launch_command, terminate_process_tree
 from ..stage_contract import (
     Stage,
     make_outputs_exist_validator,
@@ -86,6 +86,13 @@ class CliAdapter:
         """어댑터별 모델 지정 플래그. 기본은 없음(각 CLI 기본 모델 사용)."""
         return []
 
+    def runtime_info(self, job_ctx: dict[str, Any]) -> dict[str, str | None]:
+        return {
+            "cli": self.name,
+            "model": None,
+            "reasoning_effort": None,
+        }
+
     def _build_env(self, job_ctx: dict[str, Any]) -> dict[str, str]:
         env = {"PYTHONUTF8": "1"}
         image_env = job_ctx.get("image_env") or {}
@@ -122,25 +129,30 @@ def detect_cli(
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             resolve_launch_command([path, "--version"]),
             cwd=str(Path.cwd()),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
-            check=False,
             **process_group_popen_kwargs(),
         )
-    except subprocess.TimeoutExpired:
-        return AdapterInfo(
-            name=name,
-            path=path,
-            version=None,
-            available=True,
-            note=_join_notes(base_note, f"버전 확인 시간이 초과되었습니다({timeout_seconds}초)."),
-        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(process)
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return AdapterInfo(
+                name=name,
+                path=path,
+                version=None,
+                available=True,
+                note=_join_notes(base_note, f"버전 확인 시간이 초과되었습니다({timeout_seconds}초)."),
+            )
     except OSError as exc:
         return AdapterInfo(
             name=name,
@@ -150,9 +162,9 @@ def detect_cli(
             note=_join_notes(base_note, f"버전 확인을 실행하지 못했습니다: {exc}"),
         )
 
-    if completed.returncode != 0:
-        detail = _first_non_empty_line(completed.stderr, completed.stdout)
-        message = f"버전 확인 실패(exit {completed.returncode})"
+    if process.returncode != 0:
+        detail = _first_non_empty_line(stderr, stdout)
+        message = f"버전 확인 실패(exit {process.returncode})"
         if detail:
             message = f"{message}: {detail}"
         return AdapterInfo(
@@ -163,7 +175,7 @@ def detect_cli(
             note=_join_notes(base_note, message),
         )
 
-    version = _first_non_empty_line(completed.stdout, completed.stderr)
+    version = _first_non_empty_line(stdout, stderr)
     if version is None:
         return AdapterInfo(
             name=name,

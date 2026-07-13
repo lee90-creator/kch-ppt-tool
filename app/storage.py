@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,7 @@ class History:
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / HISTORY_FILE
+        self._lock = threading.RLock()
 
     def _load_history(self) -> dict[str, Any]:
         raw = _read_json(self.path, {"schema_version": SCHEMA_VERSION, "records": []})
@@ -123,14 +125,22 @@ class History:
 
     def append(self, record: dict[str, Any]) -> dict[str, Any]:
         normalized = self._normalize_record(record)
-        history = self._load_history()
-        history["records"].append(normalized)
-        _atomic_write_json(self.path, history)
+        with self._lock:
+            history = self._load_history()
+            records = history["records"]
+            for index, existing in enumerate(records):
+                if existing.get("job_id") == normalized["job_id"]:
+                    records[index] = normalized
+                    break
+            else:
+                records.append(normalized)
+            _atomic_write_json(self.path, history)
         return dict(normalized)
 
     def list(self) -> list[dict[str, Any]]:
-        history = self._load_history()
-        return [dict(record) for record in history["records"]]
+        with self._lock:
+            history = self._load_history()
+            return [dict(record) for record in history["records"]]
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         for record in reversed(self.list()):

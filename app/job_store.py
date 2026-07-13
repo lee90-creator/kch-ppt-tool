@@ -25,7 +25,7 @@ class JobStore:
             os.replace(tmp_path, path)
 
     def load_record(self, job_id: str) -> dict[str, Any] | None:
-        if not _JOB_ID_RE.fullmatch(job_id):
+        if job_id in {".", ".."} or not _JOB_ID_RE.fullmatch(job_id):
             return None
         path = self.data_dir / f"{job_id}.json"
         if not path.exists():

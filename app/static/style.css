@@ -114,6 +114,18 @@ code {
   align-items: center;
   gap: 0.35rem;
 }
+.topbar__actions,
+.log-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.topbar__version {
+  flex: 0 0 auto;
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
 
 .nav__link {
   padding: 0.55rem 0.8rem;
@@ -515,6 +527,62 @@ textarea:focus {
   margin: 0.55rem 0 0;
   color: var(--muted);
 }
+.job-progress {
+  margin-top: 1.25rem;
+  padding-top: 1.15rem;
+  border-top: 1px solid var(--line);
+}
+
+.job-progress__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.job-progress h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.job-progress__text {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  text-align: right;
+}
+
+.progress-bar {
+  height: 0.7rem;
+  margin-top: 0.7rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dfe7f5;
+}
+
+.progress-bar__value {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--primary), #6a8cff);
+  transition: width 0.2s ease;
+}
+
+.progress-bar.is-indeterminate .progress-bar__value {
+  width: 38%;
+  animation: progress-indeterminate 1.25s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+  from {
+    transform: translateX(-120%);
+  }
+
+  to {
+    transform: translateX(320%);
+  }
+}
 
 .badge {
   display: inline-flex;
@@ -548,9 +616,58 @@ textarea:focus {
 .failure-panel,
 .table-card,
 .danger-zone,
-.checklist {
+.checklist,
+.runtime-card {
   margin-top: 1rem;
   padding: 1.25rem;
+}
+.status-card {
+  padding: 1.25rem;
+}
+
+.runtime-card h2 {
+  margin: 0;
+  line-height: 1.25;
+}
+
+.runtime-details {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 1.1rem 0 0;
+}
+
+.runtime-details > div {
+  min-width: 0;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.85rem;
+  background: var(--surface-alt);
+}
+
+.runtime-details dt {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 750;
+}
+
+.runtime-details dd {
+  min-width: 0;
+  margin: 0.2rem 0 0;
+  overflow-wrap: anywhere;
+  font-weight: 800;
+}
+
+.runtime-card__package-root {
+  margin: 0.85rem 0 0;
+  color: var(--muted);
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
+}
+
+.log-card__actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .log-console {
@@ -568,7 +685,17 @@ textarea:focus {
 }
 
 .log-console.is-expanded {
-  max-height: none;
+  max-height: 80dvh;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-bar__value {
+    transition: none;
+  }
+
+  .progress-bar.is-indeterminate .progress-bar__value {
+    animation: none;
+  }
 }
 
 .table-wrap {
@@ -689,14 +816,39 @@ textarea:focus {
     flex-direction: column;
   }
 
+  .topbar__actions,
+  .job-progress__header {
+    align-items: stretch;
+  }
+
+  .topbar__actions,
+  .log-card__actions {
+    width: 100%;
+  }
+
   .nav {
     flex-wrap: wrap;
+  }
+
+  .runtime-details {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .form-grid,
   .choice-list,
   .steps,
   .guide-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  .topbar__actions,
+  .job-progress__header {
+    flex-direction: column;
+  }
+
+  .runtime-details {
     grid-template-columns: 1fr;
   }
 }
