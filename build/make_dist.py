@@ -133,6 +133,7 @@ def build(args: argparse.Namespace) -> int:
     _require_file(requirements)
     _require_file(import_smoke)
     _require_file(webtool_root / "START.bat")
+    _require_file(webtool_root / "README.txt")
     _require_file(version_file)
     _require_dir(webtool_root / "app")
     _require_dir(webtool_root / "tools")
@@ -313,6 +314,7 @@ def assemble_layout(
     (site_packages / "sitecustomize.py").write_text(SITECUSTOMIZE_PY, encoding="utf-8", newline="\n")
 
     shutil.copy2(webtool_root / "START.bat", package_dir / "START.bat")
+    shutil.copy2(webtool_root / "README.txt", package_dir / "README.txt")
     (package_dir / "VERSION").write_text(f"{version_tag}\n", encoding="utf-8", newline="\n")
     _copytree(webtool_root / "app", package_dir / "app", IGNORE_COMMON)
     _copytree(webtool_root / "tools", package_dir / "tools", IGNORE_COMMON)
